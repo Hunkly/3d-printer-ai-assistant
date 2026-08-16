@@ -1,0 +1,56 @@
+# Example configuration. Copy to config/config.yaml (runtime) or
+# config/config.local.yaml (gitignored) and adjust. Paths are relative to the
+# project root unless absolute.
+
+app:
+  name: print-engineer
+  version: 0.1.0
+  log_level: INFO
+
+mcp:
+  server_name: print-engineer-mcp
+  host: 127.0.0.1
+  port: 8765
+
+storage:
+  root: runtime/data
+  db_dir: runtime/data/db
+  workspace_dir: runtime/data/workspace
+
+logging:
+  log_dir: runtime/logs
+  json_log_path: runtime/logs/audit.jsonl
+  max_bytes: 1048576
+  backup_count: 5
+
+# Slicer integration.
+slicer:
+  executable: null
+  kind: null
+
+# Deterministic model analysis (STL / 3MF).
+analysis:
+  default_overhang_threshold_degrees: 45.0
+
+# Local LLM provider used for recommendation reasoning (Ollama by default).
+llm:
+  enabled: true
+  provider: ollama
+  base_url: http://127.0.0.1:11434
+  model: qwen3-coder:30b
+  timeout_seconds: 120.0
+  temperature: 0.2
+
+# AI print recommendation engine (Phase 3A).
+recommend:
+  default_goal: balanced
+  default_slicer: orca_slicer
+  overhang_percent_threshold: 10.0
+  thin_wall_min_ratio: 2.5
+  allow_deterministic_fallback: true
+  slice_timeout_seconds: 600.0
+
+# Printer integration (LAN MQTT). Secrets go in .env.
+printer:
+  host: null
+  serial: null

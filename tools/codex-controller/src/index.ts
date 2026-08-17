@@ -1,4 +1,5 @@
 import { Codex } from "@openai/codex-sdk";
+import type { ThreadEvent, ThreadItem } from "@openai/codex-sdk";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -52,19 +53,73 @@ function ensureTaskBranch(repo: string, branch: string, base: string): void {
   requireSafeWorkingTree(repo);
   git(repo, "fetch", "origin", base);
 
-  const exists = (() => {
-    try {
-      git(repo, "rev-parse", "--verify", branch);
-      return true;
-    } catch {
-      return false;
-    }
-  })();
+  let exists = false;
+  try {
+    execFileSync("git", ["-C", repo, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    exists = true;
+  } catch {
+    exists = false;
+  }
 
   if (exists) {
     git(repo, "switch", branch);
   } else {
     git(repo, "switch", "-c", branch, `origin/${base}`);
+  }
+}
+
+function printCompletedItem(item: ThreadItem): string | null {
+  switch (item.type) {
+    case "agent_message":
+      console.log(`\nCodex: ${item.text}\n`);
+      return item.text;
+    case "command_execution": {
+      const exitText = item.exit_code !== undefined ? ` (exit ${item.exit_code})` : "";
+      console.log(`[command] ${item.command}${exitText}`);
+      return null;
+    }
+    case "file_change":
+      for (const change of item.changes) {
+        console.log(`[file] ${change.kind}: ${change.path}`);
+      }
+      return null;
+    default:
+      return null;
+  }
+}
+
+function printUpdatedItem(item: ThreadItem): void {
+  if (item.type === "todo_list") {
+    console.log("[todo]");
+    for (const todo of item.items) {
+      console.log(`  ${todo.completed ? "x" : "-"} ${todo.text}`);
+    }
+  }
+}
+
+function printEvent(event: ThreadEvent): string | null {
+  switch (event.type) {
+    case "thread.started":
+      console.log(`[codex] thread ${event.thread_id}`);
+      return null;
+    case "turn.started":
+      console.log("[codex] turn started");
+      return null;
+    case "item.completed":
+      return printCompletedItem(event.item);
+    case "item.started":
+    case "item.updated":
+      printUpdatedItem(event.item);
+      return null;
+    case "turn.completed":
+      console.log(
+        `[codex] turn completed; input=${event.usage.input_tokens}, cached=${event.usage.cached_input_tokens}, output=${event.usage.output_tokens}`
+      );
+      return null;
+    case "turn.failed":
+      throw new Error(`Codex turn failed: ${event.error.message}`);
+    case "error":
+      throw new Error(`Codex stream failed: ${event.message}`);
   }
 }
 
@@ -98,7 +153,18 @@ async function main(): Promise<void> {
     `Task: ${task}`,
   ].join("\n");
 
-  const result = await thread.run(prompt);
+  console.log(`[controller] task=${taskKey} branch=${branch}`);
+  console.log("[controller] starting Codex stream...");
+
+  const { events } = await thread.runStreamed(prompt);
+  let finalResponse = "";
+
+  for await (const event of events) {
+    const response = printEvent(event);
+    if (response !== null) {
+      finalResponse = response;
+    }
+  }
 
   if (!existing) {
     const threadId = thread.id;
@@ -109,7 +175,9 @@ async function main(): Promise<void> {
     saveState(statePath, state);
   }
 
-  process.stdout.write(result.finalResponse + "\n");
+  if (!finalResponse) {
+    console.warn("[controller] Codex completed without a final agent message.");
+  }
 }
 
 main().catch((error: unknown) => {

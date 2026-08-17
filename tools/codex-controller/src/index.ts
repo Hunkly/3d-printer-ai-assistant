@@ -89,7 +89,11 @@ async function main(): Promise<void> {
   const result = await thread.run(prompt);
 
   if (!existing) {
-    state.threads[taskKey] = { threadId: thread.id, branch };
+    const threadId = thread.id;
+    if (!threadId) {
+      throw new Error("Codex did not return a persistent thread ID; cannot save resumable task state.");
+    }
+    state.threads[taskKey] = { threadId, branch };
     saveState(statePath, state);
   }
 

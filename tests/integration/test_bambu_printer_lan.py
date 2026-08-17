@@ -6,20 +6,29 @@ operator deliberately enables the hardware gate and supplies all LAN secrets.
 
 from __future__ import annotations
 
+import json
 import os
+import time
+from typing import Any
 
 import pytest
 
 from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
+from print_engineer.adapters.printer.transport import PahoMqttClientFactory
 from print_engineer.core.types import AMSInfo, PrinterState, PrinterStatus
 
 _HARDWARE_OPT_IN = "RUN_BAMBU_LAN_HARDWARE_TEST"
+_PASSIVE_RECEIVE_OPT_IN = "RUN_BAMBU_LAN_PASSIVE_RECEIVE_TEST"
 _REQUIRED_CONFIG = ("BAMBU_IP", "BAMBU_SERIAL", "BAMBU_ACCESS_CODE")
+_PASSIVE_WINDOW_SECONDS = 12.0
+_PASSIVE_FETCH_SECONDS = 2.0
 
 
-def _hardware_config() -> tuple[str, str, str]:
+def _hardware_config(
+    opt_in_name: str = _HARDWARE_OPT_IN,
+) -> tuple[str, str, str]:
     """Return LAN credentials only after explicit hardware opt-in."""
-    if os.environ.get(_HARDWARE_OPT_IN) != "1":
+    if os.environ.get(opt_in_name) != "1":
         pytest.skip("Bambu LAN hardware verification is not explicitly enabled")
 
     host = os.environ.get("BAMBU_IP")
@@ -39,6 +48,17 @@ def _hardware_config() -> tuple[str, str, str]:
     assert serial is not None
     assert access_code is not None
     return host, serial, access_code
+
+
+def _print_field_names(payload: bytes) -> list[str]:
+    """Return only sanitized print-object field names from a report."""
+    try:
+        report: Any = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pytest.fail("Bambu LAN passive report was not valid UTF-8 JSON")
+    if not isinstance(report, dict) or not isinstance(report.get("print"), dict):
+        pytest.fail("Bambu LAN passive report had an invalid object structure")
+    return sorted(str(name) for name in report["print"])
 
 
 def test_bambu_a1_read_only_status_over_lan() -> None:
@@ -73,3 +93,42 @@ def test_bambu_a1_read_only_status_over_lan() -> None:
             assert all(isinstance(slot, str) for slot in status.ams.slots)
     finally:
         adapter.disconnect()
+
+
+def test_bambu_a1_passive_multi_report_receive_over_lan() -> None:
+    """Observe sanitized passive report shapes over one real connection."""
+    host, serial, access_code = _hardware_config(_PASSIVE_RECEIVE_OPT_IN)
+    client = PahoMqttClientFactory()(
+        host=host,
+        port=8883,
+        username="bblp",
+        password=access_code,
+        client_id=f"print-engineer-passive-{serial}",
+    )
+    topic = f"device/{serial}/report"
+    report_count = 0
+    timeout_count = 0
+    observed_fields: set[str] = set()
+
+    try:
+        client.connect()
+        started = time.monotonic()
+        deadline = started + _PASSIVE_WINDOW_SECONDS
+        while (remaining := deadline - time.monotonic()) > 0:
+            payload = client.fetch_report(
+                topic, min(_PASSIVE_FETCH_SECONDS, remaining)
+            )
+            if payload is None:
+                timeout_count += 1
+                continue
+            report_count += 1
+            field_names = _print_field_names(payload)
+            observed_fields.update(field_names)
+            elapsed = time.monotonic() - started
+            print(f"report {report_count}: +{elapsed:.3f}s fields={field_names}")
+    finally:
+        client.disconnect()
+
+    print(f"union fields={sorted(observed_fields)}")
+    print(f"report count={report_count}; timeout count={timeout_count}")
+    assert report_count > 0, "No passive Bambu LAN reports were received"

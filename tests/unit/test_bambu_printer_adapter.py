@@ -52,13 +52,17 @@ class _FakeClient:
         self.username = username
         self.password = password
         self.client_id = client_id
+        self.connect_count = 0
         self.disconnect_count = 0
 
     def connect(self) -> None:
+        self.connect_count += 1
         if self.factory.connect_error is not None:
             raise self.factory.connect_error
 
     def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None:
+        if self.factory.payloads:
+            return self.factory.payloads.pop(0)
         return self.factory.payload
 
     def disconnect(self) -> None:
@@ -71,6 +75,7 @@ class _FakeFactory:
     def __init__(self) -> None:
         self.clients: list[_FakeClient] = []
         self.payload: bytes | None = None
+        self.payloads: list[bytes] = []
         self.connect_error: MqttConnectionError | None = None
 
     def __call__(
@@ -397,6 +402,31 @@ def test_disconnect_after_invalid_payload() -> None:
     with pytest.raises(PrinterInvalidReport):
         _status(factory=factory, payload=b"{not json")
     assert factory.clients[0].disconnect_count == 1
+
+
+def test_retained_connection_reads_distinct_reports_on_one_client() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload({"gcode_state": "RUNNING", "mc_percent": 10}),
+        _payload({"gcode_state": "PAUSE", "mc_percent": 20}),
+    ]
+    adapter = _make_adapter(factory=factory)
+
+    adapter.connect()
+    first = adapter.get_status()
+    second = adapter.get_status()
+
+    assert len(factory.clients) == 1
+    client = factory.clients[0]
+    assert client.connect_count == 1
+    assert client.disconnect_count == 0
+    assert first.state == PrinterState.PRINTING
+    assert first.progress == 0.1
+    assert second.state == PrinterState.PAUSED
+    assert second.progress == 0.2
+
+    adapter.disconnect()
+    assert client.disconnect_count == 1
 
 
 # --- Unsupported operations ------------------------------------------------

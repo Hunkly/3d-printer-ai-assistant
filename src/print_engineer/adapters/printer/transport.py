@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ssl
 import threading
+from queue import Empty, Full, Queue
 from typing import Any, Protocol
 
 import paho.mqtt.client as mqtt
@@ -15,6 +16,7 @@ from paho.mqtt.properties import Properties
 from paho.mqtt.reasoncodes import ReasonCode
 
 _CONNACK_WAIT_SECONDS = 10.0
+_REPORT_QUEUE_CAPACITY = 32
 
 
 class MqttConnectionError(Exception):
@@ -59,8 +61,11 @@ class PahoMqttClient:
         )
         self._connected = threading.Event()
         self._connack_failure: str | None = None
-        self._report_received = threading.Event()
-        self._payload: bytes | None = None
+        self._is_connected = False
+        self._receive_lock = threading.Lock()
+        self._report_queues: dict[str, Queue[bytes]] = {}
+        self._subscribed_topics: set[str] = set()
+        self._dropped_report_count = 0
         self._client.on_connect = self._on_connect
         self._client.on_connect_fail = self._on_connect_fail
         self._client.on_message = self._on_message
@@ -87,10 +92,33 @@ class PahoMqttClient:
     def _on_message(
         self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage
     ) -> None:
-        self._payload = message.payload
-        self._report_received.set()
+        with self._receive_lock:
+            report_queue = self._report_queues.get(message.topic)
+            if report_queue is None:
+                return
+            try:
+                report_queue.put_nowait(message.payload)
+            except Full:
+                try:
+                    report_queue.get_nowait()
+                except Empty:
+                    pass
+                else:
+                    self._dropped_report_count += 1
+                report_queue.put_nowait(message.payload)
+
+    def _reset_receive_state(self) -> None:
+        with self._receive_lock:
+            self._report_queues.clear()
+            self._subscribed_topics.clear()
+            self._dropped_report_count = 0
 
     def connect(self) -> None:
+        if self._is_connected:
+            return
+        self._reset_receive_state()
+        self._connected.clear()
+        self._connack_failure = None
         self._client.tls_set(
             cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLS_CLIENT
         )
@@ -98,30 +126,52 @@ class PahoMqttClient:
         try:
             self._client.connect(self._host, self._port, keepalive=60)
         except (OSError, ValueError) as exc:
+            self._reset_receive_state()
             raise MqttConnectionError("unreachable") from exc
         self._client.loop_start()
         if not self._connected.wait(timeout=_CONNACK_WAIT_SECONDS):
             self._client.loop_stop()
+            self._reset_receive_state()
             raise MqttConnectionError("unreachable")
         if self._connack_failure is not None:
             self._client.loop_stop()
+            self._reset_receive_state()
             raise MqttConnectionError(self._connack_failure)
+        self._is_connected = True
 
     def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None:
-        self._payload = None
-        self._report_received.clear()
-        self._client.subscribe(topic, qos=0)
-        if not self._report_received.wait(timeout=timeout_seconds):
-            self._client.loop_stop()
+        with self._receive_lock:
+            report_queue = self._report_queues.get(topic)
+            if report_queue is None:
+                report_queue = Queue(maxsize=_REPORT_QUEUE_CAPACITY)
+                self._report_queues[topic] = report_queue
+            should_subscribe = topic not in self._subscribed_topics
+            if should_subscribe:
+                self._subscribed_topics.add(topic)
+        if should_subscribe:
+            try:
+                self._client.subscribe(topic, qos=0)
+            except Exception:
+                with self._receive_lock:
+                    self._subscribed_topics.discard(topic)
+                raise
+        try:
+            return report_queue.get(timeout=timeout_seconds)
+        except Empty:
             return None
-        self._client.loop_stop()
-        return self._payload
 
     def disconnect(self) -> None:
+        if not self._is_connected:
+            self._reset_receive_state()
+            return
         try:
             self._client.disconnect()
         finally:
-            self._client.loop_stop()
+            try:
+                self._client.loop_stop()
+            finally:
+                self._is_connected = False
+                self._reset_receive_state()
 
 
 class MqttClientFactory(Protocol):

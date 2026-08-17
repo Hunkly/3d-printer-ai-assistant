@@ -11,11 +11,23 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-function requireCleanWorkingTree(repo: string): void {
-  const status = git(repo, "status", "--porcelain");
-  if (status) {
+function requireSafeWorkingTree(repo: string): void {
+  const lines = git(repo, "status", "--porcelain")
+    .split("\n")
+    .filter(Boolean);
+  const trackedChanges = lines.filter((line) => !line.startsWith("??"));
+
+  if (trackedChanges.length > 0) {
     throw new Error(
-      "Working tree is not clean. Commit/stash unrelated work before letting the controller switch branches."
+      "Working tree has tracked changes. Commit/stash them before letting the controller switch branches."
+    );
+  }
+
+  const untracked = lines.filter((line) => line.startsWith("??"));
+  if (untracked.length > 0) {
+    console.warn(
+      "Leaving untracked files untouched while switching branches:\n" +
+        untracked.map((line) => `  ${line.slice(3)}`).join("\n")
     );
   }
 }
@@ -37,7 +49,7 @@ function saveState(path: string, state: ControllerState): void {
 }
 
 function ensureTaskBranch(repo: string, branch: string, base: string): void {
-  requireCleanWorkingTree(repo);
+  requireSafeWorkingTree(repo);
   git(repo, "fetch", "origin", base);
 
   const exists = (() => {

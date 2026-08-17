@@ -1,7 +1,7 @@
 import { Codex } from "@openai/codex-sdk";
 import type { ThreadEvent, ThreadItem } from "@openai/codex-sdk";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 interface TaskState {
@@ -99,13 +99,13 @@ function ensureWorktree(
   const worktree = resolve(worktreeRoot, taskKey);
   mkdirSync(worktreeRoot, { recursive: true });
 
-  try {
-    git(repo, "worktree", "list", "--porcelain");
-    if (git(repo, "worktree", "list", "--porcelain").includes(`worktree ${worktree}`)) {
+  if (existsSync(resolve(worktree, ".git"))) {
+    try {
+      run("git", ["-C", worktree, "rev-parse", "--is-inside-work-tree"]);
       return worktree;
+    } catch {
+      throw new Error(`Existing worktree path is not a valid Git worktree: ${worktree}`);
     }
-  } catch {
-    // Fall through and create it.
   }
 
   let branchExists = true;

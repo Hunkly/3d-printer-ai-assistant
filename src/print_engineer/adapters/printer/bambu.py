@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from time import monotonic
 from typing import Any, NoReturn
 
 from print_engineer.adapters.printer.transport import (
@@ -48,6 +49,7 @@ _GCODE_STATE_MAP: dict[str, PrinterState] = {
     "FAILED": PrinterState.ERROR,
     "UNKNOWN": PrinterState.UNKNOWN,
 }
+_TERMINAL_GCODE_STATES = {"IDLE", "FINISH", "FAILED"}
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -91,6 +93,83 @@ def _normalize_ams(ams: Any) -> AMSInfo | None:
     return AMSInfo(is_connected=bool(ams), slots=slots)
 
 
+class _BambuStatusAccumulator:
+    """Connection-scoped last-known state assembled from sparse Bambu deltas."""
+
+    def __init__(self) -> None:
+        self._state = PrinterState.UNKNOWN
+        self._state_observed = False
+        self._bed_temp: float | None = None
+        self._nozzle_temp: float | None = None
+        self._target_bed_temp: float | None = None
+        self._target_nozzle_temp: float | None = None
+        self._progress: float | None = None
+        self._ams: AMSInfo | None = None
+        self._report_applied = False
+
+    @property
+    def ready(self) -> bool:
+        """Whether connected telemetry and a recognized state were observed."""
+        return self._report_applied and self._state_observed
+
+    @property
+    def has_report(self) -> bool:
+        """Whether at least one structurally valid delta was applied."""
+        return self._report_applied
+
+    def apply(self, print_obj: dict[str, Any]) -> None:
+        """Apply one structurally valid ``print`` delta."""
+        self._report_applied = True
+
+        raw_state = print_obj.get("gcode_state")
+        if "gcode_state" in print_obj and isinstance(raw_state, str):
+            state = _GCODE_STATE_MAP.get(raw_state)
+            if state is not None:
+                if raw_state in _TERMINAL_GCODE_STATES:
+                    self._progress = None
+                self._state = state
+                self._state_observed = True
+
+        self._update_float(print_obj, "bed_temper", "_bed_temp")
+        self._update_float(print_obj, "nozzle_temper", "_nozzle_temp")
+        self._update_float(print_obj, "bed_target_temper", "_target_bed_temp")
+        self._update_float(
+            print_obj, "nozzle_target_temper", "_target_nozzle_temp"
+        )
+
+        if "mc_percent" in print_obj:
+            progress = _float_or_none(print_obj["mc_percent"])
+            if progress is not None:
+                self._progress = round(progress / 100.0, 4)
+
+        if "ams" in print_obj:
+            ams = _normalize_ams(print_obj["ams"])
+            if ams is not None:
+                self._ams = ams
+
+    def _update_float(
+        self, print_obj: dict[str, Any], field: str, attribute: str
+    ) -> None:
+        if field not in print_obj:
+            return
+        value = _float_or_none(print_obj[field])
+        if value is not None:
+            setattr(self, attribute, value)
+
+    def snapshot(self) -> PrinterStatus:
+        """Return an immutable snapshot of the accumulated last-known state."""
+        return PrinterStatus(
+            state=self._state,
+            is_connected=self._report_applied,
+            bed_temp=self._bed_temp,
+            nozzle_temp=self._nozzle_temp,
+            target_bed_temp=self._target_bed_temp,
+            target_nozzle_temp=self._target_nozzle_temp,
+            progress=self._progress,
+            ams=self._ams,
+        )
+
+
 def _normalize_status(payload: dict[str, Any]) -> PrinterStatus:
     """Normalize a Bambu report into :class:`PrinterStatus`.
 
@@ -109,28 +188,9 @@ def _normalize_status(payload: dict[str, Any]) -> PrinterStatus:
             "Printer payload has no valid 'print' object",
             details={"payload": str(payload)[:200]},
         )
-    gcode_state = print_obj.get("gcode_state")
-    if isinstance(gcode_state, str):
-        state = _GCODE_STATE_MAP.get(gcode_state, PrinterState.UNKNOWN)
-    else:
-        state = PrinterState.UNKNOWN
-    mc_percent = print_obj.get("mc_percent")
-    progress: float | None = None
-    if mc_percent is not None:
-        try:
-            progress = round(float(mc_percent) / 100.0, 4)
-        except (TypeError, ValueError):
-            progress = None
-    return PrinterStatus(
-        state=state,
-        is_connected=True,
-        bed_temp=_float_or_none(print_obj.get("bed_temper")),
-        nozzle_temp=_float_or_none(print_obj.get("nozzle_temper")),
-        target_bed_temp=_float_or_none(print_obj.get("bed_target_temper")),
-        target_nozzle_temp=_float_or_none(print_obj.get("nozzle_target_temper")),
-        progress=progress,
-        ams=_normalize_ams(print_obj.get("ams")),
-    )
+    accumulator = _BambuStatusAccumulator()
+    accumulator.apply(print_obj)
+    return accumulator.snapshot()
 
 
 class BambuPrinterAdapter(Printer):
@@ -165,6 +225,7 @@ class BambuPrinterAdapter(Printer):
         self._timeout_seconds = timeout_seconds
         self._client_factory = client_factory or PahoMqttClientFactory()
         self._client: MqttClient | None = None
+        self._accumulator = _BambuStatusAccumulator()
 
     def _build_client(self) -> MqttClient:
         return self._client_factory(
@@ -194,14 +255,8 @@ class BambuPrinterAdapter(Printer):
             },
         ) from exc
 
-    def _fetch_report(self, client: MqttClient) -> PrinterStatus:
-        topic = f"device/{self._serial}/report"
-        payload = client.fetch_report(topic, self._timeout_seconds)
-        if payload is None:
-            raise PrinterTimeout(
-                f"No status report received within {self._timeout_seconds:.1f}s",
-                details={"topic": topic, "timeout_seconds": self._timeout_seconds},
-            )
+    def _decode_report(self, payload: bytes) -> dict[str, Any]:
+        """Decode and structurally validate one raw report without mutating state."""
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
@@ -221,13 +276,52 @@ class BambuPrinterAdapter(Printer):
                 "Printer payload is not a JSON object",
                 details={"payload": text[:200]},
             )
-        return _normalize_status(data)
+        print_obj = data.get("print")
+        if not isinstance(print_obj, dict):
+            raise PrinterInvalidReport(
+                "Printer payload has no valid 'print' object",
+                details={"payload": text[:200]},
+            )
+        return print_obj
+
+    def _fetch_status(
+        self, client: MqttClient, accumulator: _BambuStatusAccumulator
+    ) -> PrinterStatus:
+        topic = f"device/{self._serial}/report"
+        deadline = monotonic() + self._timeout_seconds
+        received_in_call = False
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                if received_in_call:
+                    return accumulator.snapshot()
+                self._raise_timeout(topic)
+            payload = client.fetch_report(topic, remaining)
+            if payload is None:
+                if received_in_call:
+                    return accumulator.snapshot()
+                self._raise_timeout(topic)
+            print_obj = self._decode_report(payload)
+            accumulator.apply(print_obj)
+            received_in_call = True
+            if accumulator.ready:
+                return accumulator.snapshot()
+
+    def _raise_timeout(self, topic: str) -> NoReturn:
+        raise PrinterTimeout(
+            f"No status report received within {self._timeout_seconds:.1f}s",
+            details={"topic": topic, "timeout_seconds": self._timeout_seconds},
+        )
 
     def connect(self) -> None:
+        if self._client is not None:
+            return
+        self._accumulator = _BambuStatusAccumulator()
         client = self._build_client()
         try:
             client.connect()
         except MqttConnectionError as exc:
+            self._accumulator = _BambuStatusAccumulator()
             self._raise_connection_error(exc)
         self._client = client
 
@@ -235,21 +329,23 @@ class BambuPrinterAdapter(Printer):
         client = self._client
         if client is None:
             client = self._build_client()
+            accumulator = _BambuStatusAccumulator()
             try:
                 client.connect()
-                return self._fetch_report(client)
+                return self._fetch_status(client, accumulator)
             except MqttConnectionError as exc:
                 self._raise_connection_error(exc)
             finally:
                 client.disconnect()
-        return self._fetch_report(client)
+        return self._fetch_status(client, self._accumulator)
 
     def disconnect(self) -> None:
-        if self._client is not None:
-            try:
+        try:
+            if self._client is not None:
                 self._client.disconnect()
-            finally:
-                self._client = None
+        finally:
+            self._client = None
+            self._accumulator = _BambuStatusAccumulator()
 
     def _unsupported(self, operation: str) -> NoReturn:
         raise PrinterOperationUnsupported(

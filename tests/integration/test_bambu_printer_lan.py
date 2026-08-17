@@ -19,6 +19,7 @@ from print_engineer.core.types import AMSInfo, PrinterState, PrinterStatus
 
 _HARDWARE_OPT_IN = "RUN_BAMBU_LAN_HARDWARE_TEST"
 _PASSIVE_RECEIVE_OPT_IN = "RUN_BAMBU_LAN_PASSIVE_RECEIVE_TEST"
+_STATE_ACCUMULATOR_OPT_IN = "RUN_BAMBU_LAN_STATE_ACCUMULATOR_TEST"
 _REQUIRED_CONFIG = ("BAMBU_IP", "BAMBU_SERIAL", "BAMBU_ACCESS_CODE")
 _PASSIVE_WINDOW_SECONDS = 12.0
 _PASSIVE_FETCH_SECONDS = 2.0
@@ -132,3 +133,32 @@ def test_bambu_a1_passive_multi_report_receive_over_lan() -> None:
     print(f"union fields={sorted(observed_fields)}")
     print(f"report count={report_count}; timeout count={timeout_count}")
     assert report_count > 0, "No passive Bambu LAN reports were received"
+
+
+def test_bambu_a1_passive_state_accumulator_over_lan() -> None:
+    """Observe three sanitized accumulated snapshots on one real connection."""
+    host, serial, access_code = _hardware_config(_STATE_ACCUMULATOR_OPT_IN)
+    adapter = BambuPrinterAdapter(
+        host=host,
+        serial=serial,
+        access_code=access_code,
+        timeout_seconds=10.0,
+    )
+
+    try:
+        adapter.connect()
+        started = time.monotonic()
+        for ordinal in range(1, 4):
+            status = adapter.get_status()
+            elapsed = time.monotonic() - started
+            print(
+                f"snapshot {ordinal}: +{elapsed:.3f}s "
+                f"state={status.state.value} progress={status.progress} "
+                f"bed={status.bed_temp} nozzle={status.nozzle_temp} "
+                f"target_bed={status.target_bed_temp} "
+                f"target_nozzle={status.target_nozzle_temp} "
+                f"ams_present={status.ams is not None}"
+            )
+            assert status.is_connected is True
+    finally:
+        adapter.disconnect()

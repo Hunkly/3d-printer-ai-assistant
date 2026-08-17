@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import print_engineer.adapters.printer.bambu as bambu_module
 from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
 from print_engineer.adapters.printer.transport import MqttConnectionError
 from print_engineer.core.types import PrinterState, PrinterStatus, TemperatureSetpoint
@@ -54,6 +55,7 @@ class _FakeClient:
         self.client_id = client_id
         self.connect_count = 0
         self.disconnect_count = 0
+        self.fetch_timeouts: list[float] = []
 
     def connect(self) -> None:
         self.connect_count += 1
@@ -61,12 +63,17 @@ class _FakeClient:
             raise self.factory.connect_error
 
     def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None:
+        self.fetch_timeouts.append(timeout_seconds)
         if self.factory.payloads:
             return self.factory.payloads.pop(0)
-        return self.factory.payload
+        payload = self.factory.payload
+        self.factory.payload = None
+        return payload
 
     def disconnect(self) -> None:
         self.disconnect_count += 1
+        if self.factory.disconnect_error is not None:
+            raise self.factory.disconnect_error
 
 
 class _FakeFactory:
@@ -77,6 +84,7 @@ class _FakeFactory:
         self.payload: bytes | None = None
         self.payloads: list[bytes] = []
         self.connect_error: MqttConnectionError | None = None
+        self.disconnect_error: Exception | None = None
 
     def __call__(
         self,
@@ -427,6 +435,167 @@ def test_retained_connection_reads_distinct_reports_on_one_client() -> None:
 
     adapter.disconnect()
     assert client.disconnect_count == 1
+
+
+def test_retained_connection_accumulates_sparse_reports() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload(
+            {"gcode_state": "RUNNING", "bed_temper": 65, "nozzle_temper": 220}
+        ),
+        _payload({"mc_percent": 25}),
+    ]
+    adapter = _make_adapter(factory=factory)
+
+    adapter.connect()
+    first = adapter.get_status()
+    second = adapter.get_status()
+
+    assert len(factory.clients) == 1
+    assert first.state == PrinterState.PRINTING
+    assert first.progress is None
+    assert second.state == PrinterState.PRINTING
+    assert second.bed_temp == 65.0
+    assert second.nozzle_temp == 220.0
+    assert second.progress == 0.25
+    assert factory.clients[0].disconnect_count == 0
+
+    adapter.disconnect()
+    assert factory.clients[0].disconnect_count == 1
+
+
+def test_retained_timeout_preserves_accumulator_for_later_report() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    first = adapter.get_status()
+
+    with pytest.raises(PrinterTimeout):
+        adapter.get_status()
+
+    factory.payloads = [_payload({"mc_percent": 50})]
+    later = adapter.get_status()
+    assert first.bed_temp == later.bed_temp == 65.0
+    assert later.state == PrinterState.PRINTING
+    assert later.progress == 0.5
+
+
+def test_disconnect_reconnect_resets_accumulator() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    assert adapter.get_status().bed_temp == 65.0
+    adapter.disconnect()
+
+    factory.payloads = [_payload({"gcode_state": "IDLE"})]
+    adapter.connect()
+    status = adapter.get_status()
+    assert status.state == PrinterState.IDLE
+    assert status.bed_temp is None
+    assert len(factory.clients) == 2
+
+
+def test_repeated_connect_is_idempotent() -> None:
+    factory = _FakeFactory()
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.connect()
+    assert len(factory.clients) == 1
+    assert factory.clients[0].connect_count == 1
+
+
+def test_invalid_report_does_not_corrupt_retained_accumulator() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.get_status()
+
+    factory.payloads = [b'{"print": "invalid"}']
+    with pytest.raises(PrinterInvalidReport):
+        adapter.get_status()
+
+    factory.payloads = [_payload({"mc_percent": 10})]
+    status = adapter.get_status()
+    assert status.state == PrinterState.PRINTING
+    assert status.bed_temp == 65.0
+    assert status.progress == 0.1
+
+
+def test_standalone_combines_sparse_reports_until_state_ready() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload({"bed_temper": 65}),
+        _payload({"nozzle_temper": 220}),
+        _payload({"gcode_state": "RUNNING"}),
+    ]
+    status, _, _ = _status(factory=factory)
+    assert status.state == PrinterState.PRINTING
+    assert status.bed_temp == 65.0
+    assert status.nozzle_temp == 220.0
+
+
+def test_standalone_uses_one_total_monotonic_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    times = iter([100.0, 100.0, 101.0])
+    monkeypatch.setattr(bambu_module, "monotonic", lambda: next(times))
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload({"bed_temper": 65}),
+        _payload({"gcode_state": "RUNNING"}),
+    ]
+
+    _status(factory=factory)
+
+    assert factory.clients[0].fetch_timeouts == [10.0, 9.0]
+
+
+def test_standalone_returns_partial_after_telemetry_without_state() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"bed_temper": 65})]
+    status, _, _ = _status(factory=factory)
+    assert status.is_connected is True
+    assert status.state == PrinterState.UNKNOWN
+    assert status.bed_temp == 65.0
+
+
+def test_failed_connect_does_not_leak_previous_accumulator() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.get_status()
+    adapter.disconnect()
+
+    factory.connect_error = MqttConnectionError("unreachable")
+    with pytest.raises(PrinterUnreachable):
+        adapter.connect()
+    factory.connect_error = None
+    factory.payloads = [_payload({"gcode_state": "IDLE"})]
+    adapter.connect()
+    assert adapter.get_status().bed_temp is None
+
+
+def test_disconnect_exception_still_resets_session() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.get_status()
+
+    factory.disconnect_error = RuntimeError("disconnect failed")
+    with pytest.raises(RuntimeError, match="disconnect failed"):
+        adapter.disconnect()
+
+    factory.disconnect_error = None
+    factory.payloads = [_payload({"gcode_state": "IDLE"})]
+    adapter.connect()
+    status = adapter.get_status()
+    assert status.state == PrinterState.IDLE
+    assert status.bed_temp is None
 
 
 # --- Unsupported operations ------------------------------------------------

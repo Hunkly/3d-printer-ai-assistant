@@ -284,7 +284,20 @@ class BambuPrinterAdapter(Printer):
             )
         return print_obj
 
-    def _fetch_status(
+    def _fetch_and_apply_report(
+        self,
+        client: MqttClient,
+        accumulator: _BambuStatusAccumulator,
+        topic: str,
+        timeout_seconds: float,
+    ) -> bool:
+        payload = client.fetch_report(topic, timeout_seconds)
+        if payload is None:
+            return False
+        accumulator.apply(self._decode_report(payload))
+        return True
+
+    def _fetch_cold_status(
         self, client: MqttClient, accumulator: _BambuStatusAccumulator
     ) -> PrinterStatus:
         topic = f"device/{self._serial}/report"
@@ -296,16 +309,25 @@ class BambuPrinterAdapter(Printer):
                 if received_in_call:
                     return accumulator.snapshot()
                 self._raise_timeout(topic)
-            payload = client.fetch_report(topic, remaining)
-            if payload is None:
+            if not self._fetch_and_apply_report(
+                client, accumulator, topic, remaining
+            ):
                 if received_in_call:
                     return accumulator.snapshot()
                 self._raise_timeout(topic)
-            print_obj = self._decode_report(payload)
-            accumulator.apply(print_obj)
             received_in_call = True
             if accumulator.ready:
                 return accumulator.snapshot()
+
+    def _fetch_warm_status(
+        self, client: MqttClient, accumulator: _BambuStatusAccumulator
+    ) -> PrinterStatus:
+        topic = f"device/{self._serial}/report"
+        if not self._fetch_and_apply_report(
+            client, accumulator, topic, self._timeout_seconds
+        ):
+            self._raise_timeout(topic)
+        return accumulator.snapshot()
 
     def _raise_timeout(self, topic: str) -> NoReturn:
         raise PrinterTimeout(
@@ -332,12 +354,14 @@ class BambuPrinterAdapter(Printer):
             accumulator = _BambuStatusAccumulator()
             try:
                 client.connect()
-                return self._fetch_status(client, accumulator)
+                return self._fetch_cold_status(client, accumulator)
             except MqttConnectionError as exc:
                 self._raise_connection_error(exc)
             finally:
                 client.disconnect()
-        return self._fetch_status(client, self._accumulator)
+        if self._accumulator.has_report:
+            return self._fetch_warm_status(client, self._accumulator)
+        return self._fetch_cold_status(client, self._accumulator)
 
     def disconnect(self) -> None:
         try:

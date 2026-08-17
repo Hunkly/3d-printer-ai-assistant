@@ -464,18 +464,107 @@ def test_retained_connection_accumulates_sparse_reports() -> None:
     assert factory.clients[0].disconnect_count == 1
 
 
+def test_warm_sparse_refresh_fetches_exactly_one_report() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload(
+            {
+                "gcode_state": "RUNNING",
+                "mc_percent": 51,
+                "bed_temper": 65,
+                "nozzle_temper": 220,
+            }
+        )
+    ]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.get_status()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+
+    factory.payloads = [_payload({"nozzle_temper": 219.8})]
+    status = adapter.get_status()
+
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert client.fetch_timeouts[-1] == 10.0
+    assert status.state == PrinterState.PRINTING
+    assert status.progress == 0.51
+    assert status.bed_temp == 65.0
+    assert status.nozzle_temp == 219.8
+
+
+def test_valid_partial_report_makes_retained_session_warm() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"mc_percent": 51, "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    partial = adapter.get_status()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+
+    factory.payloads = [_payload({"nozzle_temper": 220})]
+    status = adapter.get_status()
+
+    assert partial.state == PrinterState.UNKNOWN
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert status.state == PrinterState.UNKNOWN
+    assert status.progress == 0.51
+    assert status.bed_temp == 65.0
+    assert status.nozzle_temp == 220.0
+
+
+def test_warm_unmodeled_delta_returns_without_another_fetch() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    before = adapter.get_status()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+
+    factory.payloads = [_payload({"wifi_signal": "-48dBm"})]
+    after = adapter.get_status()
+
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert after == before
+
+
+def test_warm_malformed_modeled_delta_returns_last_known_good() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload({"gcode_state": "RUNNING", "nozzle_temper": 220})
+    ]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    adapter.get_status()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+
+    factory.payloads = [_payload({"nozzle_temper": "invalid"})]
+    status = adapter.get_status()
+
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert status.nozzle_temp == 220.0
+
+
 def test_retained_timeout_preserves_accumulator_for_later_report() -> None:
     factory = _FakeFactory()
     factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
     adapter = _make_adapter(factory=factory)
     adapter.connect()
     first = adapter.get_status()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
 
     with pytest.raises(PrinterTimeout):
         adapter.get_status()
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert client.disconnect_count == 0
 
     factory.payloads = [_payload({"mc_percent": 50})]
+    fetches_before = len(client.fetch_timeouts)
     later = adapter.get_status()
+    assert len(client.fetch_timeouts) - fetches_before == 1
     assert first.bed_temp == later.bed_temp == 65.0
     assert later.state == PrinterState.PRINTING
     assert later.progress == 0.5
@@ -497,28 +586,57 @@ def test_disconnect_reconnect_resets_accumulator() -> None:
     assert len(factory.clients) == 2
 
 
-def test_repeated_connect_is_idempotent() -> None:
+def test_repeated_connect_preserves_warm_session() -> None:
     factory = _FakeFactory()
+    factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
     adapter = _make_adapter(factory=factory)
     adapter.connect()
+    adapter.get_status()
     adapter.connect()
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+    factory.payloads = [_payload({"mc_percent": 25})]
+    status = adapter.get_status()
+
     assert len(factory.clients) == 1
-    assert factory.clients[0].connect_count == 1
+    assert client.connect_count == 1
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert status.state == PrinterState.PRINTING
+    assert status.bed_temp == 65.0
+    assert status.progress == 0.25
 
 
-def test_invalid_report_does_not_corrupt_retained_accumulator() -> None:
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        b"\xff\xfe\x00",
+        b"{not json",
+        b"[]",
+        b"{}",
+        b'{"print": "invalid"}',
+    ],
+)
+def test_invalid_report_does_not_corrupt_retained_accumulator(
+    invalid_payload: bytes,
+) -> None:
     factory = _FakeFactory()
     factory.payloads = [_payload({"gcode_state": "RUNNING", "bed_temper": 65})]
     adapter = _make_adapter(factory=factory)
     adapter.connect()
     adapter.get_status()
 
-    factory.payloads = [b'{"print": "invalid"}']
+    client = factory.clients[0]
+    fetches_before = len(client.fetch_timeouts)
+    factory.payloads = [invalid_payload]
     with pytest.raises(PrinterInvalidReport):
         adapter.get_status()
+    assert len(client.fetch_timeouts) - fetches_before == 1
+    assert client.disconnect_count == 0
 
     factory.payloads = [_payload({"mc_percent": 10})]
+    fetches_before = len(client.fetch_timeouts)
     status = adapter.get_status()
+    assert len(client.fetch_timeouts) - fetches_before == 1
     assert status.state == PrinterState.PRINTING
     assert status.bed_temp == 65.0
     assert status.progress == 0.1

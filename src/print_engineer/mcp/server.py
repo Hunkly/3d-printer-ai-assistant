@@ -25,7 +25,7 @@ def create_server(settings: Settings) -> FastMCP:
 
     mcp = FastMCP(settings.mcp.server_name, version=__version__)
 
-    from print_engineer.mcp.tools import model, recommend, slicer, system
+    from print_engineer.mcp.tools import model, printer, recommend, slicer, system
 
     mcp.tool(name="system.info", description="Project metadata (name, version, runtime).")(
         system.system_info
@@ -39,6 +39,8 @@ def create_server(settings: Settings) -> FastMCP:
         mcp.tool(name=name, description=_model_tool_description(name))(tool)
     for name, tool in recommend.build_tools(settings).items():
         mcp.tool(name=name, description=_recommend_tool_description(name))(tool)
+    for name, tool in printer.build_tools(settings).items():
+        mcp.tool(name=name, description=_printer_tool_description(name))(tool)
     return mcp
 
 
@@ -64,6 +66,17 @@ def _recommend_tool_description(name: str) -> str:
         ),
     }
     return descriptions.get(name, "Print recommendation tool.")
+
+
+def _printer_tool_description(name: str) -> str:
+    descriptions = {
+        "printer.status": (
+            "Read-only printer status over LAN MQTT: state, connectivity, "
+            "temperatures, progress, and AMS slots. Never starts, stops, pauses, "
+            "or resumes printing; never publishes MQTT messages; never slices."
+        ),
+    }
+    return descriptions.get(name, "Printer tool.")
 
 
 def _model_tool_description(name: str) -> str:

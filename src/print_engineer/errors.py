@@ -141,3 +141,57 @@ class LLMInvalidResponse(LLMError):
     """The LLM returned output that failed validation against the schema."""
 
     code = "llm_invalid_response"
+
+
+class PrinterError(PrintEngineerError):
+    """Base class for printer-related errors.
+
+    Every printer error carries a stable machine-readable ``code`` plus a
+    ``details`` mapping so MCP clients can react programmatically.
+    """
+
+    code = "printer_error"
+
+    def __init__(self, message: str = "", *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details: dict[str, Any] = dict(details or {})
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the error into a machine-readable mapping."""
+        return {"code": self.code, "message": str(self), "details": self.details}
+
+
+class PrinterNotConfigured(PrinterError):
+    """Connection parameters (host/serial/access code) are missing."""
+
+    code = "printer_not_configured"
+
+
+class PrinterUnreachable(PrinterError):
+    """The printer could not be reached over the network (TCP/TLS)."""
+
+    code = "printer_unreachable"
+
+
+class PrinterAuthFailed(PrinterError):
+    """The MQTT broker rejected the access code (CONNACK rc 4/5)."""
+
+    code = "printer_auth_failed"
+
+
+class PrinterTimeout(PrinterError):
+    """No status report was received within the allowed time budget."""
+
+    code = "printer_timeout"
+
+
+class PrinterInvalidReport(PrinterError):
+    """The printer payload was not valid JSON or not a status report."""
+
+    code = "printer_invalid_report"
+
+
+class PrinterOperationUnsupported(PrinterError):
+    """The operation is not supported by the read-only printer increment."""
+
+    code = "printer_operation_unsupported"

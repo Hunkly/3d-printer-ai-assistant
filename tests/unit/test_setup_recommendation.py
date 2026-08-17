@@ -23,7 +23,10 @@ from print_engineer.recommendation.context import PrintContextResolver
 from print_engineer.recommendation.filament import FilamentMatrixBuilder
 from print_engineer.recommendation.setup import SetupEngine
 
-_BASE = {"nozzle_diameter": "0.4;0.2;0.6;0.8"}
+_BASE = {
+    "nozzle_diameter": "0.4;0.2;0.6;0.8",
+    "default_print_profile": "0.20mm Standard @BBL A1",
+}
 _VARIANT_04 = {
     "printer_model": "Bambu Lab A1",
     "printer_variant": "0.4",

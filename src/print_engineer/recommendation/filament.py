@@ -308,10 +308,10 @@ def _rank(candidates: list[FilamentCandidate], goal: RecommendationGoal) -> None
         if "filament_usage" in weights:
             metrics["filament_usage"] = 0.5 * density_scores[index] + 0.5 * cost_scores[index]
         base = sum(weights.get(metric, 0.0) * value for metric, value in metrics.items())
-        data_quality = 15.0 if candidate.vendor_verified else 0.0
-        data_quality += max(0.0, 10.0 - 5.0 * len(candidate.data_warnings))
+        data_quality = 40.0 if candidate.vendor_verified else 0.0
+        data_quality += max(0.0, 30.0 - 15.0 * len(candidate.data_warnings))
         candidate.goal_scores = {metric: round(value, 3) for metric, value in metrics.items()}
-        candidate.score = max(0.0, min(100.0, round(100.0 * base + data_quality, 1)))
+        candidate.score = max(0.0, round(100.0 * base + data_quality, 1))
         if goal in (RecommendationGoal.STRENGTH, RecommendationGoal.SURFACE_QUALITY):
             candidate.requires_external_evidence = True
 

@@ -4,33 +4,40 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+interface TaskState {
+  threadId: string;
+  branch: string;
+  worktree?: string;
+  issueNumber?: number;
+  prUrl?: string;
+}
+
 interface ControllerState {
-  threads: Record<string, { threadId: string; branch: string }>;
+  threads: Record<string, TaskState>;
+}
+
+interface GitHubIssue {
+  number: number;
+  title: string;
+  body: string;
+  state: string;
+  url: string;
+}
+
+function run(command: string, args: string[], cwd?: string): string {
+  return execFileSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 }
 
 function git(repo: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  return run("git", ["-C", repo, ...args]);
 }
 
-function requireSafeWorkingTree(repo: string): void {
-  const lines = git(repo, "status", "--porcelain")
-    .split("\n")
-    .filter(Boolean);
-  const trackedChanges = lines.filter((line) => !line.startsWith("??"));
-
-  if (trackedChanges.length > 0) {
-    throw new Error(
-      "Working tree has tracked changes. Commit/stash them before letting the controller switch branches."
-    );
-  }
-
-  const untracked = lines.filter((line) => line.startsWith("??"));
-  if (untracked.length > 0) {
-    console.warn(
-      "Leaving untracked files untouched while switching branches:\n" +
-        untracked.map((line) => `  ${line.slice(3)}`).join("\n")
-    );
-  }
+function gh(repo: string, ...args: string[]): string {
+  return run("gh", args, repo);
 }
 
 function loadState(path: string): ControllerState {
@@ -49,22 +56,149 @@ function saveState(path: string, state: ControllerState): void {
   writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
-function ensureTaskBranch(repo: string, branch: string, base: string): void {
-  requireSafeWorkingTree(repo);
-  git(repo, "fetch", "origin", base);
-
-  let exists = false;
+function assertGitHubCli(repo: string): void {
   try {
-    execFileSync("git", ["-C", repo, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
-    exists = true;
+    gh(repo, "auth", "status");
   } catch {
-    exists = false;
+    throw new Error(
+      "GitHub CLI is missing or not authenticated. Install gh, then run `gh auth login` once."
+    );
+  }
+}
+
+function getRepositoryName(repo: string): string {
+  return gh(repo, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner");
+}
+
+function readIssue(repo: string, repository: string, issueNumber: number): GitHubIssue {
+  const raw = gh(
+    repo,
+    "issue",
+    "view",
+    String(issueNumber),
+    "--repo",
+    repository,
+    "--json",
+    "number,title,body,state,url"
+  );
+  const issue = JSON.parse(raw) as GitHubIssue;
+  if (issue.state.toUpperCase() !== "OPEN") {
+    throw new Error(`Issue #${issue.number} is not open; refusing to start new work from it.`);
+  }
+  return issue;
+}
+
+function ensureWorktree(
+  repo: string,
+  taskKey: string,
+  branch: string,
+  base: string,
+  worktreeRoot: string
+): string {
+  git(repo, "fetch", "origin", base);
+  const worktree = resolve(worktreeRoot, taskKey);
+  mkdirSync(worktreeRoot, { recursive: true });
+
+  try {
+    git(repo, "worktree", "list", "--porcelain");
+    if (git(repo, "worktree", "list", "--porcelain").includes(`worktree ${worktree}`)) {
+      return worktree;
+    }
+  } catch {
+    // Fall through and create it.
   }
 
-  if (exists) {
-    git(repo, "switch", branch);
+  let branchExists = true;
+  try {
+    run("git", ["-C", repo, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+  } catch {
+    branchExists = false;
+  }
+
+  if (branchExists) {
+    git(repo, "worktree", "add", worktree, branch);
   } else {
-    git(repo, "switch", "-c", branch, `origin/${base}`);
+    git(repo, "worktree", "add", "-b", branch, worktree, `origin/${base}`);
+  }
+  return worktree;
+}
+
+function listUntracked(repo: string): Set<string> {
+  const output = execFileSync("git", ["-C", repo, "ls-files", "--others", "--exclude-standard", "-z"], {
+    encoding: "utf8",
+  });
+  return new Set(output.split("\0").filter(Boolean));
+}
+
+function stageCodexChanges(repo: string, baselineUntracked: Set<string>): void {
+  git(repo, "add", "-u");
+  const after = listUntracked(repo);
+  for (const path of after) {
+    if (!baselineUntracked.has(path)) {
+      git(repo, "add", "--", path);
+    }
+  }
+}
+
+function hasStagedChanges(repo: string): boolean {
+  try {
+    execFileSync("git", ["-C", repo, "diff", "--cached", "--quiet"]);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function commitAndPush(repo: string, branch: string, title: string): string | null {
+  if (!hasStagedChanges(repo)) {
+    console.log("[controller] no Codex changes to commit");
+    return null;
+  }
+
+  const commitTitle = `Codex: ${title}`.slice(0, 72);
+  git(repo, "commit", "-m", commitTitle);
+  git(repo, "push", "-u", "origin", branch);
+  return git(repo, "rev-parse", "HEAD");
+}
+
+function findOrCreateDraftPr(
+  repo: string,
+  repository: string,
+  branch: string,
+  base: string,
+  issue: GitHubIssue,
+  finalResponse: string
+): string {
+  try {
+    return gh(repo, "pr", "view", branch, "--repo", repository, "--json", "url", "--jq", ".url");
+  } catch {
+    const body = [
+      `Implements #${issue.number}.`,
+      "",
+      "## Codex report",
+      "",
+      finalResponse || "Codex completed without a final textual report.",
+      "",
+      "---",
+      "Created automatically by the local Codex controller. This PR is intentionally a draft pending review.",
+    ].join("\n");
+
+    return gh(
+      repo,
+      "pr",
+      "create",
+      "--repo",
+      repository,
+      "--draft",
+      "--base",
+      base,
+      "--head",
+      branch,
+      "--title",
+      issue.title,
+      "--body",
+      body
+    );
   }
 }
 
@@ -123,37 +257,32 @@ function printEvent(event: ThreadEvent): string | null {
   }
 }
 
-async function main(): Promise<void> {
-  const taskKey = process.env.CODEX_TASK_KEY;
-  const task = process.env.CODEX_TASK;
-  const repo = resolve(process.env.CODEX_REPO ?? "../..");
-  const base = process.env.CODEX_BASE_BRANCH ?? "master";
-  const statePath = resolve(process.env.CODEX_STATE ?? ".codex/controller-state.json");
-
-  if (!taskKey || !task) {
-    throw new Error("Set CODEX_TASK_KEY and CODEX_TASK before starting the controller.");
-  }
-
-  const branch = `codex/${taskKey}`;
-  ensureTaskBranch(repo, branch, base);
-
-  const state = loadState(statePath);
+async function runCodexTask(
+  taskKey: string,
+  task: string,
+  workingDirectory: string,
+  branch: string,
+  state: ControllerState,
+  statePath: string
+): Promise<string> {
   const codex = new Codex();
   const existing = state.threads[taskKey];
   const thread = existing
-    ? codex.resumeThread(existing.threadId, { workingDirectory: repo })
-    : codex.startThread({ workingDirectory: repo });
+    ? codex.resumeThread(existing.threadId, { workingDirectory })
+    : codex.startThread({ workingDirectory });
 
   const prompt = [
     "Follow the repository AGENTS.md execution contract.",
-    "Work only on the task below. Do not push, merge, or open a pull request.",
-    "Inspect git status before editing. Run the focused tests and applicable Ruff/Mypy checks required by AGENTS.md.",
+    "Work only on the task below. Do not push, merge, commit, or open a pull request; the controller owns Git publication.",
+    "Do not inspect the whole repository unless the task genuinely requires it. Start from the files/plans named in the task and follow direct dependencies only as needed.",
+    "Inspect git status before editing. Run focused tests and applicable Ruff/Mypy checks required by AGENTS.md.",
     "At the end, inspect git status, git diff --stat, and git diff, then report what changed and verification results.",
     "",
     `Task: ${task}`,
   ].join("\n");
 
   console.log(`[controller] task=${taskKey} branch=${branch}`);
+  console.log(`[controller] worktree=${workingDirectory}`);
   console.log("[controller] starting Codex stream...");
 
   const { events } = await thread.runStreamed(prompt);
@@ -171,12 +300,77 @@ async function main(): Promise<void> {
     if (!threadId) {
       throw new Error("Codex did not return a persistent thread ID; cannot save resumable task state.");
     }
-    state.threads[taskKey] = { threadId, branch };
+    state.threads[taskKey] = { threadId, branch, worktree: workingDirectory };
     saveState(statePath, state);
   }
 
-  if (!finalResponse) {
-    console.warn("[controller] Codex completed without a final agent message.");
+  return finalResponse;
+}
+
+async function runGitHubIssueMode(repo: string, issueNumber: number, base: string, statePath: string): Promise<void> {
+  assertGitHubCli(repo);
+  const repository = process.env.CODEX_GITHUB_REPO ?? getRepositoryName(repo);
+  const issue = readIssue(repo, repository, issueNumber);
+  const taskKey = `issue-${issue.number}`;
+  const branch = `codex/${taskKey}`;
+  const worktreeRoot = resolve(process.env.CODEX_WORKTREE_ROOT ?? "../../../.codex-worktrees");
+  const state = loadState(statePath);
+  const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
+  const baselineUntracked = listUntracked(worktree);
+
+  const task = [`GitHub issue #${issue.number}: ${issue.title}`, "", issue.body].join("\n");
+  const finalResponse = await runCodexTask(taskKey, task, worktree, branch, state, statePath);
+
+  stageCodexChanges(worktree, baselineUntracked);
+  const commit = commitAndPush(worktree, branch, issue.title);
+  if (!commit) {
+    console.log("[controller] task completed without code changes; no PR created");
+    return;
+  }
+
+  const prUrl = findOrCreateDraftPr(worktree, repository, branch, base, issue, finalResponse);
+  state.threads[taskKey] = {
+    ...state.threads[taskKey],
+    branch,
+    worktree,
+    issueNumber: issue.number,
+    prUrl,
+  };
+  saveState(statePath, state);
+  console.log(`[controller] pushed ${commit}`);
+  console.log(`[controller] draft PR: ${prUrl}`);
+}
+
+async function runManualMode(repo: string, base: string, statePath: string): Promise<void> {
+  const taskKey = process.env.CODEX_TASK_KEY;
+  const task = process.env.CODEX_TASK;
+  if (!taskKey || !task) {
+    throw new Error(
+      "Set CODEX_ISSUE_NUMBER for GitHub mode, or CODEX_TASK_KEY and CODEX_TASK for manual mode."
+    );
+  }
+
+  const branch = `codex/${taskKey}`;
+  const worktreeRoot = resolve(process.env.CODEX_WORKTREE_ROOT ?? "../../../.codex-worktrees");
+  const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
+  const state = loadState(statePath);
+  await runCodexTask(taskKey, task, worktree, branch, state, statePath);
+}
+
+async function main(): Promise<void> {
+  const repo = resolve(process.env.CODEX_REPO ?? "../..");
+  const base = process.env.CODEX_BASE_BRANCH ?? "master";
+  const statePath = resolve(process.env.CODEX_STATE ?? ".codex/controller-state.json");
+  const issueValue = process.env.CODEX_ISSUE_NUMBER;
+
+  if (issueValue) {
+    const issueNumber = Number(issueValue);
+    if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+      throw new Error("CODEX_ISSUE_NUMBER must be a positive integer.");
+    }
+    await runGitHubIssueMode(repo, issueNumber, base, statePath);
+  } else {
+    await runManualMode(repo, base, statePath);
   }
 }
 

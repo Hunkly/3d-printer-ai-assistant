@@ -14,5 +14,8 @@
       }
     }
   },
-  "model": "ollama/qwen3-coder-opencode"
+  "model": "ollama/qwen3-coder-opencode",
+  "plugin": [
+    "superpowers@git+https://github.com/obra/superpowers.git"
+  ]
 }

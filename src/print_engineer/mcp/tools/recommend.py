@@ -156,6 +156,85 @@ class RecommendTools:
             return {"ok": False, "error": exc.to_dict()}
         return {"ok": True, "setup": result.model_dump(mode="json")}
 
+    def filament_candidates(
+        self,
+        slicer_kind: str | None = None,
+        printer: str | None = None,
+        nozzle_diameter_mm: float | None = None,
+        build_plate: str | None = None,
+        goal: str | None = None,
+        vendor: str | None = None,
+        material: str | None = None,
+        use_defaults: bool = False,
+    ) -> dict[str, Any]:
+        """Enumerate and rank local filament profiles (read-only, never slices)."""
+        try:
+            intent = PrintContextIntent(
+                slicer_kind=slicer_kind or self._settings.recommend.default_slicer,
+                printer=printer,
+                nozzle_diameter_mm=nozzle_diameter_mm,
+                build_plate=build_plate,
+                use_defaults=use_defaults,
+            )
+            resolver = PrintContextResolver(self._settings)
+            resolved = resolver.resolve(intent)
+            adapter = resolver.adapter(intent.slicer_kind)
+            matrix = FilamentMatrixBuilder(self._settings, adapter).build(
+                resolved,
+                goal=cast(RecommendationGoal, goal or self._settings.recommend.default_goal),
+                vendor=vendor,
+                material=material,
+            )
+        except (SlicerError, LLMError, ValidationError) as exc:
+            if isinstance(exc, ValidationError):
+                exc = SlicerError(
+                    "invalid filament_candidates request",
+                    details={"validation_errors": str(exc)[:500]},
+                )
+            return {"ok": False, "error": exc.to_dict()}
+        return {"ok": True, "matrix": matrix.model_dump(mode="json")}
+
+    def setup(
+        self,
+        printer: str,
+        slicer_kind: str | None = None,
+        nozzle_diameter_mm: float | None = None,
+        build_plate: str | None = None,
+        process_profile: str | None = None,
+        filament_profile: str | None = None,
+        goal: str | None = None,
+        vendor: str | None = None,
+        material: str | None = None,
+        use_defaults: bool = False,
+        use_llm: bool = True,
+    ) -> dict[str, Any]:
+        """Four-layer setup recommendation (read-only, never slices)."""
+        try:
+            request = SetupRequest(
+                slicer_kind=slicer_kind or self._settings.recommend.default_slicer,
+                printer=printer,
+                nozzle_diameter_mm=nozzle_diameter_mm,
+                build_plate=build_plate,
+                process_profile=process_profile,
+                filament_profile=filament_profile,
+                use_defaults=use_defaults,
+                goal=cast(RecommendationGoal, goal or self._settings.recommend.default_goal),
+                vendor=vendor,
+                material=material,
+                use_llm=use_llm,
+            )
+            llm = build_llm_client(self._settings.llm) if use_llm else None
+            engine = SetupEngine(self._settings, llm=llm)
+            result = engine.recommend(request)
+        except (SlicerError, LLMError, ValidationError) as exc:
+            if isinstance(exc, ValidationError):
+                exc = SlicerError(
+                    "invalid setup request",
+                    details={"validation_errors": str(exc)[:500]},
+                )
+            return {"ok": False, "error": exc.to_dict()}
+        return {"ok": True, "setup": result.model_dump(mode="json")}
+
 
 def build_tools(settings: Any) -> dict[str, Callable[..., dict[str, Any]]]:
     """Return the ``print.*`` tool callables bound to *settings*."""

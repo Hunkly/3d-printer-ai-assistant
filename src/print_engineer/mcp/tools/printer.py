@@ -5,18 +5,19 @@ Strictly read-only: resolves the configured printer, calls
 Never starts/stops/pauses printing, never changes temperature, never
 publishes MQTT messages, never accesses the camera, never slices.
 
-Returns ``{"ok": true, "status": {...}}`` on success and
+Returns ``{"ok": true, "status": {...}, "summary": "..."}`` on success and
 ``{"ok": false, "error": {code, message, details}}`` on structured failure.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from math import floor, isfinite
 from typing import Any, cast
 
 from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
 from print_engineer.config import Settings
-from print_engineer.core.types import PrinterStatus
+from print_engineer.core.types import PrinterState, PrinterStatus
 from print_engineer.errors import PrinterError, PrinterNotConfigured
 
 
@@ -70,6 +71,83 @@ def _serialize_status(status: PrinterStatus) -> dict[str, Any]:
     }
 
 
+_STATE_SUMMARIES = {
+    PrinterState.OFFLINE: "Offline",
+    PrinterState.IDLE: "Idle",
+    PrinterState.PRINTING: "Printing",
+    PrinterState.PAUSED: "Paused",
+    PrinterState.ERROR: "Printer error",
+    PrinterState.UNKNOWN: "Status unknown",
+}
+
+
+def _format_temperature(value: float | None) -> str | None:
+    """Format one finite temperature for compact status presentation."""
+    if value is None or not isfinite(value):
+        return None
+    formatted = format(value, ".1f")
+    if formatted.endswith(".0"):
+        return formatted[:-2]
+    return formatted
+
+
+def _temperature_fragment(
+    name: str, current: float | None, target: float | None
+) -> str | None:
+    current_text = _format_temperature(current)
+    target_text = _format_temperature(target)
+    if current_text is not None and target_text is not None:
+        return f"{name} {current_text} / {target_text} °C"
+    if current_text is not None:
+        return f"{name} {current_text} °C"
+    if target_text is not None:
+        return f"{name} target {target_text} °C"
+    return None
+
+
+def _format_status_summary(status: PrinterStatus) -> str:
+    """Return a deterministic human-readable view of normalized status."""
+    if not status.is_connected:
+        return "Printer disconnected"
+
+    fragments = [_STATE_SUMMARIES[status.state]]
+
+    if status.progress is not None and isfinite(status.progress):
+        display_progress = min(max(status.progress, 0.0), 1.0)
+        percent = floor(display_progress * 100.0 + 0.5)
+        fragments.append(f"{percent}% complete")
+
+    if status.current_layer is not None and status.total_layers is not None:
+        fragments.append(f"Layer {status.current_layer} / {status.total_layers}")
+    elif status.current_layer is not None:
+        fragments.append(f"Layer {status.current_layer}")
+    elif status.total_layers is not None:
+        fragments.append(f"Total layers {status.total_layers}")
+
+    if status.state in {PrinterState.PRINTING, PrinterState.PAUSED}:
+        if status.remaining_time_minutes is not None:
+            fragments.append(
+                f"About {status.remaining_time_minutes} min remaining"
+            )
+
+    nozzle = _temperature_fragment(
+        "Nozzle", status.nozzle_temp, status.target_nozzle_temp
+    )
+    if nozzle is not None:
+        fragments.append(nozzle)
+
+    bed = _temperature_fragment("Bed", status.bed_temp, status.target_bed_temp)
+    if bed is not None:
+        fragments.append(bed)
+
+    if status.ams is not None:
+        fragments.append(
+            "AMS connected" if status.ams.is_connected else "AMS not connected"
+        )
+
+    return " · ".join(fragments)
+
+
 class PrinterTools:
     """Bound MCP tool implementations for one settings object."""
 
@@ -88,7 +166,11 @@ class PrinterTools:
             status = adapter.get_status()
         except PrinterError as exc:
             return {"ok": False, "error": exc.to_dict()}
-        return {"ok": True, "status": _serialize_status(status)}
+        return {
+            "ok": True,
+            "status": _serialize_status(status),
+            "summary": _format_status_summary(status),
+        }
 
 
 def build_tools(settings: Settings) -> dict[str, Callable[..., dict[str, Any]]]:

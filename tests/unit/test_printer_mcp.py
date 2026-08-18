@@ -27,6 +27,7 @@ from print_engineer.errors import (
     PrinterUnreachable,
 )
 from print_engineer.mcp.server import create_server
+from print_engineer.mcp.tools.printer import _format_status_summary
 
 
 def _ok_status() -> PrinterStatus:
@@ -68,9 +69,11 @@ class _FakeAdapter:
         self.host = host
         self.serial = serial
         self.access_code = access_code
+        self.get_status_calls = 0
         _FakeAdapter.instances.append(self)
 
     def get_status(self) -> PrinterStatus:
+        self.get_status_calls += 1
         if self.exc is not None:
             raise self.exc
         return self.status
@@ -299,6 +302,12 @@ def test_printer_status_ok_serializes_all_fields(
     assert payload["status"]["current_layer"] == 10
     assert payload["status"]["total_layers"] == 100
     assert payload["status"]["remaining_time_minutes"] == 139
+    assert payload["summary"] == (
+        "Printing · 42% complete · Layer 10 / 100 · About 139 min remaining"
+        " · Nozzle 220.5 / 220 °C · Bed 55 / 60 °C · AMS connected"
+    )
+    assert len(fake_adapter.instances) == 1
+    assert fake_adapter.instances[0].get_status_calls == 1
 
 
 def test_printer_status_serializes_unavailable_layers(
@@ -312,6 +321,7 @@ def test_printer_status_serializes_unavailable_layers(
     assert payload["status"]["remaining_time_minutes"] is None
     assert payload["status"]["state"] == "unknown"
     assert payload["status"]["is_connected"] is False
+    assert payload["summary"] == "Printer disconnected"
 
 
 def test_printer_status_unreachable(
@@ -326,6 +336,7 @@ def test_printer_status_unreachable(
     assert payload["error"]["code"] == "printer_unreachable"
     assert payload["error"]["details"]["host"] == "10.0.0.1"
     assert payload["error"]["details"]["reason"] == "unreachable"
+    assert "summary" not in payload
 
 
 def test_printer_status_auth_failed(
@@ -339,6 +350,7 @@ def test_printer_status_auth_failed(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_auth_failed"
     assert payload["error"]["details"]["hint"] == "Check BAMBU_ACCESS_CODE."
+    assert "summary" not in payload
 
 
 def test_printer_status_timeout(
@@ -352,6 +364,7 @@ def test_printer_status_timeout(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_timeout"
     assert payload["error"]["details"]["timeout_seconds"] == 10.0
+    assert "summary" not in payload
 
 
 def test_printer_status_invalid_report(
@@ -365,6 +378,7 @@ def test_printer_status_invalid_report(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_invalid_report"
     assert payload["error"]["details"]["payload"] == "{not json"
+    assert "summary" not in payload
 
 
 def test_printer_status_serialization(
@@ -378,3 +392,266 @@ def test_printer_status_serialization(
     assert isinstance(payload["status"]["ams"]["slots"], list)
     # JSON round-trip is stable
     assert json.loads(json.dumps(payload)) == payload
+
+
+def test_full_status_summary_exact() -> None:
+    status = PrinterStatus(
+        state=PrinterState.PRINTING,
+        is_connected=True,
+        progress=0.73,
+        current_layer=184,
+        total_layers=252,
+        remaining_time_minutes=32,
+        nozzle_temp=220.03125,
+        target_nozzle_temp=220.0,
+        bed_temp=54.9375,
+        target_bed_temp=55.0,
+        ams=AMSInfo(is_connected=True, slots=["A1"]),
+    )
+    assert _format_status_summary(status) == (
+        "Printing · 73% complete · Layer 184 / 252 · About 32 min remaining"
+        " · Nozzle 220 / 220 °C · Bed 54.9 / 55 °C · AMS connected"
+    )
+
+
+def test_disconnected_summary_suppresses_stale_fragments_without_mutation(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    status = PrinterStatus(
+        state=PrinterState.PRINTING,
+        is_connected=False,
+        progress=0.5,
+        current_layer=10,
+        total_layers=100,
+        remaining_time_minutes=20,
+        nozzle_temp=220.0,
+        target_nozzle_temp=220.0,
+        bed_temp=55.0,
+        target_bed_temp=55.0,
+        ams=AMSInfo(is_connected=True, slots=["A1"]),
+    )
+    fake_adapter.status = status
+
+    payload = _call_status(server)
+
+    assert payload["summary"] == "Printer disconnected"
+    assert payload["status"] == {
+        "state": "printing",
+        "is_connected": False,
+        "bed_temp": 55.0,
+        "nozzle_temp": 220.0,
+        "target_bed_temp": 55.0,
+        "target_nozzle_temp": 220.0,
+        "progress": 0.5,
+        "ams": {"is_connected": True, "slots": ["A1"]},
+        "current_layer": 10,
+        "total_layers": 100,
+        "remaining_time_minutes": 20,
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (PrinterState.OFFLINE, "Offline"),
+        (PrinterState.IDLE, "Idle"),
+        (PrinterState.PRINTING, "Printing"),
+        (PrinterState.PAUSED, "Paused"),
+        (PrinterState.ERROR, "Printer error"),
+        (PrinterState.UNKNOWN, "Status unknown"),
+    ],
+)
+def test_connected_state_summary_wording(
+    state: PrinterState, expected: str
+) -> None:
+    assert _format_status_summary(
+        PrinterStatus(state=state, is_connected=True)
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("progress", "fragment"),
+    [
+        (None, None),
+        (0.0, "0% complete"),
+        (0.724, "72% complete"),
+        (0.725, "73% complete"),
+        (0.734, "73% complete"),
+        (0.735, "74% complete"),
+        (1.0, "100% complete"),
+        (-0.1, "0% complete"),
+        (1.2, "100% complete"),
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+    ],
+)
+def test_progress_summary_formatting(
+    progress: float | None, fragment: str | None
+) -> None:
+    summary = _format_status_summary(
+        PrinterStatus(
+            state=PrinterState.UNKNOWN,
+            is_connected=True,
+            progress=progress,
+        )
+    )
+    if fragment is None:
+        assert summary == "Status unknown"
+    else:
+        assert summary == f"Status unknown · {fragment}"
+
+
+@pytest.mark.parametrize(
+    ("current", "total", "expected"),
+    [
+        (184, 252, "Printing · Layer 184 / 252"),
+        (184, None, "Printing · Layer 184"),
+        (None, 252, "Printing · Total layers 252"),
+        (None, None, "Printing"),
+        (253, 252, "Printing · Layer 253 / 252"),
+    ],
+)
+def test_layer_summary_formatting(
+    current: int | None, total: int | None, expected: str
+) -> None:
+    assert _format_status_summary(
+        PrinterStatus(
+            state=PrinterState.PRINTING,
+            is_connected=True,
+            current_layer=current,
+            total_layers=total,
+        )
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "remaining", "expected"),
+    [
+        (PrinterState.PRINTING, 32, "Printing · About 32 min remaining"),
+        (PrinterState.PAUSED, 32, "Paused · About 32 min remaining"),
+        (PrinterState.PRINTING, 0, "Printing · About 0 min remaining"),
+        (PrinterState.PAUSED, 0, "Paused · About 0 min remaining"),
+        (PrinterState.IDLE, 139, "Idle"),
+        (PrinterState.ERROR, 139, "Printer error"),
+        (PrinterState.UNKNOWN, 139, "Status unknown"),
+        (PrinterState.OFFLINE, 139, "Offline"),
+    ],
+)
+def test_remaining_time_summary_state_filtering(
+    state: PrinterState, remaining: int, expected: str
+) -> None:
+    assert _format_status_summary(
+        PrinterStatus(
+            state=state,
+            is_connected=True,
+            remaining_time_minutes=remaining,
+        )
+    ) == expected
+
+
+def test_idle_summary_preserves_structured_remaining_time(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=PrinterState.IDLE,
+        is_connected=True,
+        remaining_time_minutes=139,
+    )
+    payload = _call_status(server)
+    assert payload["summary"] == "Idle"
+    assert payload["status"]["remaining_time_minutes"] == 139
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (54.9375, "54.9"),
+        (220.03125, "220"),
+        (55.0, "55"),
+        (54.95, "55"),
+        (20.04, "20"),
+        (20.06, "20.1"),
+    ],
+)
+def test_temperature_summary_precision(value: float, expected: str) -> None:
+    assert _format_status_summary(
+        PrinterStatus(
+            state=PrinterState.IDLE,
+            is_connected=True,
+            nozzle_temp=value,
+        )
+    ) == f"Idle · Nozzle {expected} °C"
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "expected"),
+    [
+        (220.0, 225.0, "Nozzle 220 / 225 °C"),
+        (220.0, None, "Nozzle 220 °C"),
+        (None, 225.0, "Nozzle target 225 °C"),
+        (220.0, float("nan"), "Nozzle 220 °C"),
+        (float("nan"), 225.0, "Nozzle target 225 °C"),
+        (float("inf"), float("-inf"), None),
+    ],
+)
+def test_nozzle_temperature_summary_partials(
+    current: float | None, target: float | None, expected: str | None
+) -> None:
+    summary = _format_status_summary(
+        PrinterStatus(
+            state=PrinterState.IDLE,
+            is_connected=True,
+            nozzle_temp=current,
+            target_nozzle_temp=target,
+        )
+    )
+    expected_summary = "Idle" if expected is None else f"Idle · {expected}"
+    assert summary == expected_summary
+    assert "nan" not in summary
+    assert "inf" not in summary
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "expected"),
+    [
+        (55.0, 60.0, "Bed 55 / 60 °C"),
+        (55.0, None, "Bed 55 °C"),
+        (None, 60.0, "Bed target 60 °C"),
+        (None, None, None),
+    ],
+)
+def test_bed_temperature_summary_partials(
+    current: float | None, target: float | None, expected: str | None
+) -> None:
+    summary = _format_status_summary(
+        PrinterStatus(
+            state=PrinterState.IDLE,
+            is_connected=True,
+            bed_temp=current,
+            target_bed_temp=target,
+        )
+    )
+    expected_summary = "Idle" if expected is None else f"Idle · {expected}"
+    assert summary == expected_summary
+
+
+@pytest.mark.parametrize(
+    ("ams", "expected"),
+    [
+        (AMSInfo(is_connected=True, slots=["A1", "A2"]), "AMS connected"),
+        (AMSInfo(is_connected=False, slots=["A1"]), "AMS not connected"),
+        (None, None),
+    ],
+)
+def test_ams_summary_formatting(ams: AMSInfo | None, expected: str | None) -> None:
+    summary = _format_status_summary(
+        PrinterStatus(state=PrinterState.IDLE, is_connected=True, ams=ams)
+    )
+    expected_summary = "Idle" if expected is None else f"Idle · {expected}"
+    assert summary == expected_summary
+
+
+def test_summary_is_deterministic() -> None:
+    status = _ok_status()
+    assert _format_status_summary(status) == _format_status_summary(status)

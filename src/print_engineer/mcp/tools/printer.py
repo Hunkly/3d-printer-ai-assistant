@@ -5,7 +5,8 @@ Strictly read-only: resolves the configured printer, calls
 Never starts/stops/pauses printing, never changes temperature, never
 publishes MQTT messages, never accesses the camera, never slices.
 
-Returns ``{"ok": true, "status": {...}, "summary": "..."}`` on success and
+Returns ``{"ok": true, "status": {...}, "summary": "...", "assessment":
+{...}}`` on success and
 ``{"ok": false, "error": {code, message, details}}`` on structured failure.
 """
 
@@ -79,6 +80,51 @@ _STATE_SUMMARIES = {
     PrinterState.ERROR: "Printer error",
     PrinterState.UNKNOWN: "Status unknown",
 }
+
+
+def _assess_status(status: PrinterStatus) -> dict[str, str]:
+    """Classify only the normalized connection flag and printer state."""
+    if not status.is_connected:
+        return {
+            "level": "error",
+            "code": "printer_disconnected",
+            "message": "Printer is disconnected.",
+        }
+    if status.state is PrinterState.OFFLINE:
+        return {
+            "level": "attention",
+            "code": "printer_offline",
+            "message": "Printer reports an offline state.",
+        }
+    if status.state is PrinterState.IDLE:
+        return {
+            "level": "info",
+            "code": "printer_idle",
+            "message": "Printer is idle.",
+        }
+    if status.state is PrinterState.PRINTING:
+        return {
+            "level": "info",
+            "code": "printer_printing",
+            "message": "Printer is printing.",
+        }
+    if status.state is PrinterState.PAUSED:
+        return {
+            "level": "attention",
+            "code": "printer_paused",
+            "message": "Printer is paused.",
+        }
+    if status.state is PrinterState.ERROR:
+        return {
+            "level": "error",
+            "code": "printer_error",
+            "message": "Printer reports an error state.",
+        }
+    return {
+        "level": "unknown",
+        "code": "printer_state_unknown",
+        "message": "Printer state is unknown.",
+    }
 
 
 def _format_temperature(value: float | None) -> str | None:
@@ -170,6 +216,7 @@ class PrinterTools:
             "ok": True,
             "status": _serialize_status(status),
             "summary": _format_status_summary(status),
+            "assessment": _assess_status(status),
         }
 
 

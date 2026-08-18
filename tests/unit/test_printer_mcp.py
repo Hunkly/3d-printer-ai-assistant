@@ -27,7 +27,7 @@ from print_engineer.errors import (
     PrinterUnreachable,
 )
 from print_engineer.mcp.server import create_server
-from print_engineer.mcp.tools.printer import _format_status_summary
+from print_engineer.mcp.tools.printer import _assess_status, _format_status_summary
 
 
 def _ok_status() -> PrinterStatus:
@@ -245,6 +245,8 @@ def test_missing_host_returns_printer_not_configured(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_not_configured"
     assert payload["error"]["details"]["missing"] == ["host"]
+    assert "summary" not in payload
+    assert "assessment" not in payload
     assert fake_adapter.instances == []
 
 
@@ -256,6 +258,8 @@ def test_missing_serial_returns_printer_not_configured(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_not_configured"
     assert payload["error"]["details"]["missing"] == ["serial"]
+    assert "summary" not in payload
+    assert "assessment" not in payload
     assert fake_adapter.instances == []
 
 
@@ -267,6 +271,8 @@ def test_missing_access_code_returns_printer_not_configured(
     assert payload["ok"] is False
     assert payload["error"]["code"] == "printer_not_configured"
     assert payload["error"]["details"]["missing"] == ["access_code"]
+    assert "summary" not in payload
+    assert "assessment" not in payload
     assert fake_adapter.instances == []
 
 
@@ -282,6 +288,8 @@ def test_missing_multiple_values_reports_all_keys(
         "serial",
         "access_code",
     ]
+    assert "summary" not in payload
+    assert "assessment" not in payload
     assert fake_adapter.instances == []
 
 
@@ -306,6 +314,11 @@ def test_printer_status_ok_serializes_all_fields(
         "Printing · 42% complete · Layer 10 / 100 · About 139 min remaining"
         " · Nozzle 220.5 / 220 °C · Bed 55 / 60 °C · AMS connected"
     )
+    assert payload["assessment"] == {
+        "level": "info",
+        "code": "printer_printing",
+        "message": "Printer is printing.",
+    }
     assert len(fake_adapter.instances) == 1
     assert fake_adapter.instances[0].get_status_calls == 1
 
@@ -322,6 +335,11 @@ def test_printer_status_serializes_unavailable_layers(
     assert payload["status"]["state"] == "unknown"
     assert payload["status"]["is_connected"] is False
     assert payload["summary"] == "Printer disconnected"
+    assert payload["assessment"] == {
+        "level": "error",
+        "code": "printer_disconnected",
+        "message": "Printer is disconnected.",
+    }
 
 
 def test_printer_status_unreachable(
@@ -337,6 +355,7 @@ def test_printer_status_unreachable(
     assert payload["error"]["details"]["host"] == "10.0.0.1"
     assert payload["error"]["details"]["reason"] == "unreachable"
     assert "summary" not in payload
+    assert "assessment" not in payload
 
 
 def test_printer_status_auth_failed(
@@ -351,6 +370,7 @@ def test_printer_status_auth_failed(
     assert payload["error"]["code"] == "printer_auth_failed"
     assert payload["error"]["details"]["hint"] == "Check BAMBU_ACCESS_CODE."
     assert "summary" not in payload
+    assert "assessment" not in payload
 
 
 def test_printer_status_timeout(
@@ -365,6 +385,7 @@ def test_printer_status_timeout(
     assert payload["error"]["code"] == "printer_timeout"
     assert payload["error"]["details"]["timeout_seconds"] == 10.0
     assert "summary" not in payload
+    assert "assessment" not in payload
 
 
 def test_printer_status_invalid_report(
@@ -379,6 +400,7 @@ def test_printer_status_invalid_report(
     assert payload["error"]["code"] == "printer_invalid_report"
     assert payload["error"]["details"]["payload"] == "{not json"
     assert "summary" not in payload
+    assert "assessment" not in payload
 
 
 def test_printer_status_serialization(
@@ -435,6 +457,11 @@ def test_disconnected_summary_suppresses_stale_fragments_without_mutation(
     payload = _call_status(server)
 
     assert payload["summary"] == "Printer disconnected"
+    assert payload["assessment"] == {
+        "level": "error",
+        "code": "printer_disconnected",
+        "message": "Printer is disconnected.",
+    }
     assert payload["status"] == {
         "state": "printing",
         "is_connected": False,
@@ -655,3 +682,141 @@ def test_ams_summary_formatting(ams: AMSInfo | None, expected: str | None) -> No
 def test_summary_is_deterministic() -> None:
     status = _ok_status()
     assert _format_status_summary(status) == _format_status_summary(status)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            PrinterState.OFFLINE,
+            {
+                "level": "attention",
+                "code": "printer_offline",
+                "message": "Printer reports an offline state.",
+            },
+        ),
+        (
+            PrinterState.IDLE,
+            {
+                "level": "info",
+                "code": "printer_idle",
+                "message": "Printer is idle.",
+            },
+        ),
+        (
+            PrinterState.PRINTING,
+            {
+                "level": "info",
+                "code": "printer_printing",
+                "message": "Printer is printing.",
+            },
+        ),
+        (
+            PrinterState.PAUSED,
+            {
+                "level": "attention",
+                "code": "printer_paused",
+                "message": "Printer is paused.",
+            },
+        ),
+        (
+            PrinterState.ERROR,
+            {
+                "level": "error",
+                "code": "printer_error",
+                "message": "Printer reports an error state.",
+            },
+        ),
+        (
+            PrinterState.UNKNOWN,
+            {
+                "level": "unknown",
+                "code": "printer_state_unknown",
+                "message": "Printer state is unknown.",
+            },
+        ),
+    ],
+)
+def test_connected_status_assessment_table(
+    state: PrinterState, expected: dict[str, str]
+) -> None:
+    assert _assess_status(PrinterStatus(state=state, is_connected=True)) == expected
+
+
+@pytest.mark.parametrize("state", [PrinterState.PRINTING, PrinterState.ERROR])
+def test_disconnected_assessment_takes_precedence(state: PrinterState) -> None:
+    assert _assess_status(PrinterStatus(state=state, is_connected=False)) == {
+        "level": "error",
+        "code": "printer_disconnected",
+        "message": "Printer is disconnected.",
+    }
+
+
+def test_assessment_ignores_unrelated_telemetry() -> None:
+    minimal = PrinterStatus(state=PrinterState.PAUSED, is_connected=True)
+    populated = PrinterStatus(
+        state=PrinterState.PAUSED,
+        is_connected=True,
+        bed_temp=55.0,
+        nozzle_temp=220.0,
+        target_bed_temp=60.0,
+        target_nozzle_temp=225.0,
+        progress=0.75,
+        ams=AMSInfo(is_connected=True, slots=["A1", "A2"]),
+        current_layer=75,
+        total_layers=100,
+        remaining_time_minutes=45,
+    )
+    assert _assess_status(minimal) == _assess_status(populated) == {
+        "level": "attention",
+        "code": "printer_paused",
+        "message": "Printer is paused.",
+    }
+
+
+def test_successful_error_state_has_assessment(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=PrinterState.ERROR,
+        is_connected=True,
+        progress=0.5,
+    )
+
+    payload = _call_status(server)
+
+    assert payload["ok"] is True
+    assert payload["status"]["state"] == "error"
+    assert payload["summary"] == "Printer error · 50% complete"
+    assert payload["assessment"] == {
+        "level": "error",
+        "code": "printer_error",
+        "message": "Printer reports an error state.",
+    }
+
+
+def test_disconnected_error_state_preserves_structured_state(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=PrinterState.ERROR,
+        is_connected=False,
+        remaining_time_minutes=20,
+    )
+
+    payload = _call_status(server)
+
+    assert payload["ok"] is True
+    assert payload["status"]["state"] == "error"
+    assert payload["status"]["remaining_time_minutes"] == 20
+    assert payload["summary"] == "Printer disconnected"
+    assert payload["assessment"] == {
+        "level": "error",
+        "code": "printer_disconnected",
+        "message": "Printer is disconnected.",
+    }
+
+
+def test_assessment_is_deterministic() -> None:
+    status = PrinterStatus(state=PrinterState.UNKNOWN, is_connected=True)
+    assert _assess_status(status) == _assess_status(status)

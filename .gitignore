@@ -10,6 +10,7 @@ dist/
 
 # Local configuration and secrets
 .env
+.env.local
 config/config.local.yaml
 
 # Runtime data (db, logs, workspaces)

@@ -39,6 +39,9 @@ def _ok_status() -> PrinterStatus:
         target_nozzle_temp=220.0,
         progress=0.42,
         ams=AMSInfo(is_connected=True, slots=["A1", "A2"]),
+        current_layer=10,
+        total_layers=100,
+        remaining_time_minutes=139,
     )
 
 
@@ -51,6 +54,7 @@ class _FakeAdapter:
 
     instances: list[_FakeAdapter] = []
     exc: PrinterError | None = None
+    status: PrinterStatus = _ok_status()
 
     def __init__(
         self,
@@ -69,7 +73,7 @@ class _FakeAdapter:
     def get_status(self) -> PrinterStatus:
         if self.exc is not None:
             raise self.exc
-        return _ok_status()
+        return self.status
 
 
 def _settings(
@@ -112,6 +116,7 @@ def fake_adapter(monkeypatch: pytest.MonkeyPatch) -> type[_FakeAdapter]:
 
     _FakeAdapter.instances = []
     _FakeAdapter.exc = None
+    _FakeAdapter.status = _ok_status()
     monkeypatch.setattr(printer_module, "BambuPrinterAdapter", _FakeAdapter)
     return _FakeAdapter
 
@@ -291,6 +296,22 @@ def test_printer_status_ok_serializes_all_fields(
     assert payload["status"]["target_nozzle_temp"] == 220.0
     assert payload["status"]["progress"] == 0.42
     assert payload["status"]["ams"] == {"is_connected": True, "slots": ["A1", "A2"]}
+    assert payload["status"]["current_layer"] == 10
+    assert payload["status"]["total_layers"] == 100
+    assert payload["status"]["remaining_time_minutes"] == 139
+
+
+def test_printer_status_serializes_unavailable_layers(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus()
+    payload = _call_status(server)
+    assert payload["ok"] is True
+    assert payload["status"]["current_layer"] is None
+    assert payload["status"]["total_layers"] is None
+    assert payload["status"]["remaining_time_minutes"] is None
+    assert payload["status"]["state"] == "unknown"
+    assert payload["status"]["is_connected"] is False
 
 
 def test_printer_status_unreachable(

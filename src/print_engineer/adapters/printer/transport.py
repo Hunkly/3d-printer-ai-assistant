@@ -1,14 +1,12 @@
-"""MQTT transport abstraction for the Bambu Lab LAN protocol (Phase 2+).
-
-The only module that imports paho-mqtt. Strictly read-only: the transport
-subscribes to a single report topic and never publishes anything.
-"""
+"""Narrow MQTT transport for Bambu Lab LAN status telemetry."""
 
 from __future__ import annotations
 
+import json
 import ssl
 import threading
 from queue import Empty, Full, Queue
+from time import monotonic
 from typing import Any, Protocol
 
 import paho.mqtt.client as mqtt
@@ -17,6 +15,19 @@ from paho.mqtt.reasoncodes import ReasonCode
 
 _CONNACK_WAIT_SECONDS = 10.0
 _REPORT_QUEUE_CAPACITY = 32
+_REFRESH_COOLDOWN_SECONDS = 300.0
+_refresh_eligibility_lock = threading.Lock()
+_refresh_next_eligible: dict[str, float] = {}
+
+
+def _reserve_status_refresh(serial: str) -> bool:
+    """Atomically reserve one process-local refresh window for ``serial``."""
+    now = monotonic()
+    with _refresh_eligibility_lock:
+        if now < _refresh_next_eligible.get(serial, 0.0):
+            return False
+        _refresh_next_eligible[serial] = now + _REFRESH_COOLDOWN_SECONDS
+        return True
 
 
 class MqttConnectionError(Exception):
@@ -35,6 +46,8 @@ class MqttClient(Protocol):
 
     def connect(self) -> None: ...
 
+    def request_status_refresh(self) -> bool: ...
+
     def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None: ...
 
     def disconnect(self) -> None: ...
@@ -51,11 +64,13 @@ class PahoMqttClient:
         username: str,
         password: str,
         client_id: str,
+        serial: str,
     ) -> None:
         self._host = host
         self._port = port
         self._username = username
         self._password = password
+        self._serial = serial
         self._client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2, client_id=client_id
         )
@@ -66,6 +81,8 @@ class PahoMqttClient:
         self._report_queues: dict[str, Queue[bytes]] = {}
         self._subscribed_topics: set[str] = set()
         self._dropped_report_count = 0
+        self._refresh_attempted = False
+        self._sequence_id = 0
         self._client.on_connect = self._on_connect
         self._client.on_connect_fail = self._on_connect_fail
         self._client.on_message = self._on_message
@@ -139,7 +156,7 @@ class PahoMqttClient:
             raise MqttConnectionError(self._connack_failure)
         self._is_connected = True
 
-    def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None:
+    def _ensure_subscription(self, topic: str) -> None:
         with self._receive_lock:
             report_queue = self._report_queues.get(topic)
             if report_queue is None:
@@ -150,11 +167,53 @@ class PahoMqttClient:
                 self._subscribed_topics.add(topic)
         if should_subscribe:
             try:
-                self._client.subscribe(topic, qos=0)
-            except Exception:
+                result, _ = self._client.subscribe(topic, qos=0)
+            except Exception as exc:
                 with self._receive_lock:
                     self._subscribed_topics.discard(topic)
-                raise
+                raise MqttConnectionError("unreachable") from exc
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                with self._receive_lock:
+                    self._subscribed_topics.discard(topic)
+                raise MqttConnectionError("unreachable")
+
+    def request_status_refresh(self) -> bool:
+        """Issue at most one fixed informational status refresh."""
+        with self._receive_lock:
+            if self._refresh_attempted:
+                return False
+            self._refresh_attempted = True
+
+        report_topic = f"device/{self._serial}/report"
+        self._ensure_subscription(report_topic)
+        if not _reserve_status_refresh(self._serial):
+            return False
+
+        request_topic = f"device/{self._serial}/request"
+        payload = json.dumps(
+            {
+                "pushing": {
+                    "sequence_id": str(self._sequence_id),
+                    "command": "pushall",
+                    "version": 1,
+                    "push_target": 1,
+                }
+            },
+            separators=(",", ":"),
+        )
+        self._sequence_id += 1
+        try:
+            result = self._client.publish(request_topic, payload, qos=0)
+        except Exception as exc:
+            raise MqttConnectionError("unreachable") from exc
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise MqttConnectionError("unreachable")
+        return True
+
+    def fetch_report(self, topic: str, timeout_seconds: float) -> bytes | None:
+        self._ensure_subscription(topic)
+        with self._receive_lock:
+            report_queue = self._report_queues[topic]
         try:
             return report_queue.get(timeout=timeout_seconds)
         except Empty:
@@ -185,6 +244,7 @@ class MqttClientFactory(Protocol):
         username: str,
         password: str,
         client_id: str,
+        serial: str,
     ) -> MqttClient: ...
 
 
@@ -199,6 +259,7 @@ class PahoMqttClientFactory:
         username: str,
         password: str,
         client_id: str,
+        serial: str,
     ) -> MqttClient:
         return PahoMqttClient(
             host=host,
@@ -206,4 +267,5 @@ class PahoMqttClientFactory:
             username=username,
             password=password,
             client_id=client_id,
+            serial=serial,
         )

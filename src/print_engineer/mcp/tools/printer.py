@@ -64,6 +64,9 @@ def _serialize_status(status: PrinterStatus) -> dict[str, Any]:
         "target_nozzle_temp": status.target_nozzle_temp,
         "progress": status.progress,
         "ams": ams,
+        "current_layer": status.current_layer,
+        "total_layers": status.total_layers,
+        "remaining_time_minutes": status.remaining_time_minutes,
     }
 
 

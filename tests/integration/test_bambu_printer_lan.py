@@ -1,7 +1,8 @@
-"""Explicitly gated read-only probe against a real Bambu Lab A1.
+"""Explicitly gated status probes against a real Bambu Lab A1.
 
-This test never publishes or sends printer commands. It is skipped unless the
-operator deliberately enables the hardware gate and supplies all LAN secrets.
+Passive tests never publish. The standalone refresh test is separately gated
+because it may issue exactly one fixed informational pushall. No test sends a
+printer-control command.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
 from print_engineer.adapters.printer.transport import PahoMqttClientFactory
 from print_engineer.core.types import AMSInfo, PrinterState, PrinterStatus
 
-_HARDWARE_OPT_IN = "RUN_BAMBU_LAN_HARDWARE_TEST"
+_STATUS_REFRESH_OPT_IN = "RUN_BAMBU_LAN_STATUS_REFRESH_TEST"
 _PASSIVE_RECEIVE_OPT_IN = "RUN_BAMBU_LAN_PASSIVE_RECEIVE_TEST"
 _STATE_ACCUMULATOR_OPT_IN = "RUN_BAMBU_LAN_STATE_ACCUMULATOR_TEST"
 _REQUIRED_CONFIG = ("BAMBU_IP", "BAMBU_SERIAL", "BAMBU_ACCESS_CODE")
@@ -26,7 +27,7 @@ _PASSIVE_FETCH_SECONDS = 2.0
 
 
 def _hardware_config(
-    opt_in_name: str = _HARDWARE_OPT_IN,
+    opt_in_name: str = _STATUS_REFRESH_OPT_IN,
 ) -> tuple[str, str, str]:
     """Return LAN credentials only after explicit hardware opt-in."""
     if os.environ.get(opt_in_name) != "1":
@@ -63,7 +64,7 @@ def _print_field_names(payload: bytes) -> list[str]:
 
 
 def test_bambu_a1_read_only_status_over_lan() -> None:
-    """Read and normalize one real status report without changing printer state."""
+    """Request one informational status refresh and normalize its response."""
     host, serial, access_code = _hardware_config()
     adapter = BambuPrinterAdapter(
         host=host,
@@ -105,6 +106,7 @@ def test_bambu_a1_passive_multi_report_receive_over_lan() -> None:
         username="bblp",
         password=access_code,
         client_id=f"print-engineer-passive-{serial}",
+        serial=serial,
     )
     topic = f"device/{serial}/report"
     report_count = 0

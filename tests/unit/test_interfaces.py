@@ -31,6 +31,9 @@ def test_printer_status_defaults() -> None:
     assert not status.is_connected
     assert status.bed_temp is None
     assert status.ams is None
+    assert status.current_layer is None
+    assert status.total_layers is None
+    assert status.remaining_time_minutes is None
 
 
 def test_printer_status_with_ams() -> None:
@@ -39,6 +42,17 @@ def test_printer_status_with_ams() -> None:
     assert status.state == PrinterState.PRINTING
     assert status.ams is not None
     assert status.ams.slots == ["A1", "B1"]
+
+
+def test_printer_status_with_layers() -> None:
+    status = PrinterStatus(current_layer=10, total_layers=100)
+    assert status.current_layer == 10
+    assert status.total_layers == 100
+
+
+def test_printer_status_with_remaining_time() -> None:
+    status = PrinterStatus(remaining_time_minutes=139)
+    assert status.remaining_time_minutes == 139
 
 
 def test_slice_result_roundtrip(tmp_path: Path) -> None:

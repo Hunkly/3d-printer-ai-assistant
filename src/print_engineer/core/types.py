@@ -56,6 +56,9 @@ class PrinterStatus:
     target_nozzle_temp: float | None = None
     progress: float | None = None
     ams: AMSInfo | None = None
+    current_layer: int | None = None
+    total_layers: int | None = None
+    remaining_time_minutes: int | None = None
 
 
 @dataclass(frozen=True)

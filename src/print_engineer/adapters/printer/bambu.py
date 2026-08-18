@@ -1,10 +1,4 @@
-"""Bambu Lab A1 LAN MQTT printer adapter (Phase 2+, read-only increment).
-
-Strictly read-only: connects to the printer over LAN MQTT (TLS), reads the
-``device/{serial}/report`` status topic, and normalizes it into
-:class:`PrinterStatus`. Never publishes, never sends commands, never changes
-printer state.
-"""
+"""Bambu Lab A1 LAN MQTT status adapter (Phase 2+)."""
 
 from __future__ import annotations
 
@@ -62,6 +56,24 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _non_negative_int_or_none(value: Any) -> int | None:
+    """Parse an exact non-negative integer or an ASCII decimal string."""
+    if type(value) is int:
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped.isascii() and stripped.isdecimal():
+            return int(stripped, 10)
+    return None
+
+
+def _remaining_time_or_none(value: Any) -> int | None:
+    """Parse an exact non-negative whole-minute estimate."""
+    if type(value) is int and value >= 0:
+        return value
+    return None
+
+
 def _normalize_ams(ams: Any) -> AMSInfo | None:
     """Normalize the ``print.ams`` section into :class:`AMSInfo`.
 
@@ -105,6 +117,9 @@ class _BambuStatusAccumulator:
         self._target_nozzle_temp: float | None = None
         self._progress: float | None = None
         self._ams: AMSInfo | None = None
+        self._current_layer: int | None = None
+        self._total_layers: int | None = None
+        self._remaining_time_minutes: int | None = None
         self._report_applied = False
 
     @property
@@ -147,12 +162,31 @@ class _BambuStatusAccumulator:
             if ams is not None:
                 self._ams = ams
 
+        self._update_layer(print_obj, "layer_num", "_current_layer")
+        self._update_layer(print_obj, "total_layer_num", "_total_layers")
+
+        if "mc_remaining_time" in print_obj:
+            remaining_time = _remaining_time_or_none(
+                print_obj["mc_remaining_time"]
+            )
+            if remaining_time is not None:
+                self._remaining_time_minutes = remaining_time
+
     def _update_float(
         self, print_obj: dict[str, Any], field: str, attribute: str
     ) -> None:
         if field not in print_obj:
             return
         value = _float_or_none(print_obj[field])
+        if value is not None:
+            setattr(self, attribute, value)
+
+    def _update_layer(
+        self, print_obj: dict[str, Any], field: str, attribute: str
+    ) -> None:
+        if field not in print_obj:
+            return
+        value = _non_negative_int_or_none(print_obj[field])
         if value is not None:
             setattr(self, attribute, value)
 
@@ -167,6 +201,9 @@ class _BambuStatusAccumulator:
             target_nozzle_temp=self._target_nozzle_temp,
             progress=self._progress,
             ams=self._ams,
+            current_layer=self._current_layer,
+            total_layers=self._total_layers,
+            remaining_time_minutes=self._remaining_time_minutes,
         )
 
 
@@ -234,6 +271,7 @@ class BambuPrinterAdapter(Printer):
             username=_BAMBU_MQTT_USERNAME,
             password=self._access_code,
             client_id=f"print-engineer-{self._serial}",
+            serial=self._serial,
         )
 
     def _raise_connection_error(self, exc: MqttConnectionError) -> NoReturn:
@@ -290,12 +328,22 @@ class BambuPrinterAdapter(Printer):
         accumulator: _BambuStatusAccumulator,
         topic: str,
         timeout_seconds: float,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         payload = client.fetch_report(topic, timeout_seconds)
         if payload is None:
-            return False
-        accumulator.apply(self._decode_report(payload))
-        return True
+            return None
+        print_obj = self._decode_report(payload)
+        accumulator.apply(print_obj)
+        return print_obj
+
+    @staticmethod
+    def _is_full_snapshot(print_obj: dict[str, Any]) -> bool:
+        msg = print_obj.get("msg")
+        return (
+            print_obj.get("command") == "push_status"
+            and type(msg) is int
+            and msg == 0
+        )
 
     def _fetch_cold_status(
         self, client: MqttClient, accumulator: _BambuStatusAccumulator
@@ -309,23 +357,24 @@ class BambuPrinterAdapter(Printer):
                 if received_in_call:
                     return accumulator.snapshot()
                 self._raise_timeout(topic)
-            if not self._fetch_and_apply_report(
+            print_obj = self._fetch_and_apply_report(
                 client, accumulator, topic, remaining
-            ):
+            )
+            if print_obj is None:
                 if received_in_call:
                     return accumulator.snapshot()
                 self._raise_timeout(topic)
             received_in_call = True
-            if accumulator.ready:
+            if self._is_full_snapshot(print_obj) or accumulator.ready:
                 return accumulator.snapshot()
 
     def _fetch_warm_status(
         self, client: MqttClient, accumulator: _BambuStatusAccumulator
     ) -> PrinterStatus:
         topic = f"device/{self._serial}/report"
-        if not self._fetch_and_apply_report(
+        if self._fetch_and_apply_report(
             client, accumulator, topic, self._timeout_seconds
-        ):
+        ) is None:
             self._raise_timeout(topic)
         return accumulator.snapshot()
 
@@ -354,6 +403,7 @@ class BambuPrinterAdapter(Printer):
             accumulator = _BambuStatusAccumulator()
             try:
                 client.connect()
+                client.request_status_refresh()
                 return self._fetch_cold_status(client, accumulator)
             except MqttConnectionError as exc:
                 self._raise_connection_error(exc)

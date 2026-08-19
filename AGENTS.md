@@ -1,222 +1,112 @@
 # Codex Project Execution Contract
 
-Codex is the primary planning, implementation, and review agent for this repository. Follow this file as the durable project execution contract unless a higher-priority source of truth says otherwise.
+Codex is the primary planning, implementation, and review agent for this repository. Follow this contract unless a higher-priority source of truth says otherwise.
 
-## Project
+## Project and source of truth
 
-This repository is the **3D Printer AI Assistant**. Primary current areas include:
-
-- slicer and profile integration
-- model analysis
-- print recommendation
-- Bambu Lab A1 LAN integration
-- MCP tools
-
-Repository requirements and approved plan files are authoritative over assumptions.
-
-## Source of truth
+This repository is the **3D Printer AI Assistant**. Current areas include slicer/profile integration, model analysis, print recommendations, Bambu Lab A1 LAN integration, and MCP tools.
 
 Use this priority order:
 
 1. Current explicit user instruction
 2. An `APPROVED` plan under `plans/`
 3. This `AGENTS.md`
-4. Existing repository architecture and tests
-5. README and roadmap material
+4. Existing architecture and tests
+5. README/roadmap
 6. Inference
 
-Do not invent missing requirements from TODOs, class names, phase names, or likely future functionality. Do not assume a requested feature is missing; inspect the implementation first.
+Do not invent requirements from TODOs, phase names, class names, or likely future work. Do not assume a requested feature is missing; inspect the relevant implementation first. If an approved plan materially conflicts with the repository, stop and report the conflict.
 
-If an approved plan conflicts materially with the repository, stop and report the conflict instead of silently redesigning the implementation.
+## Default workflow
 
-## Local repository and internet usage
+For non-trivial work use `PLAN → APPROVE → BUILD → REVIEW`.
 
-This is a local Windows repository. The repository root is the current working directory.
-
-- Inspect the repository with local file search, text search, file reads, and PowerShell commands.
-- Start with targeted file discovery, then search for relevant symbols, then read only the necessary files.
-- Never use GitHub, WebFetch, a remote API, or an invented repository URL to inspect this repository.
-- Never use an explore tool or explore subagent.
-- Do not ask the user for repository information that can be obtained locally.
-Local repository evidence is primary for repository behavior.
-
-External documentation may be consulted when implementation depends on an external library, protocol, API, hardware interface, or version-specific behavior that cannot be established reliably from the repository alone.
-
-Prefer authoritative sources:
-
-1. official documentation
-2. official source code / upstream repository
-3. protocol specifications
-4. reputable implementation references
-
-Clearly distinguish external evidence from repository evidence.
-
-Never use web research as a substitute for inspecting local repository code.
-
-## Workflow
-
-For non-trivial work use:
-
-`PLAN → APPROVE → BUILD → REVIEW`
-
-During planning or research:
-
-- Do not modify files unless explicitly instructed.
-- Do not create unnecessary files or run unnecessary long-lived processes.
-- Inspect the existing implementation before proposing changes.
-
-When an `APPROVED` plan already exists, Codex acting as Build must not repeat the planning phase. Treat the approved plan as an implementation contract.
+When an `APPROVED` plan exists, **do not plan again**. Treat it as the implementation contract.
 
 Build must:
 
-- read the approved plan
-- inspect directly relevant files
-- inspect `git status --short` before implementation
-- implement exactly the approved scope
-- run focused tests
-- run focused Ruff and Mypy checks
-- inspect `git status --short`, `git diff --stat`, and `git diff` afterward
-- report verification results and stop when the requested phase is complete
+- read the approved plan once;
+- inspect `git status --short` before editing;
+- inspect only directly relevant files and dependencies;
+- implement exactly the approved scope;
+- run focused tests and focused Ruff/Mypy checks;
+- inspect final `git status --short`, `git diff --stat`, and the task-relevant diff;
+- report verification results and stop.
 
-Build must not:
+Do not reinterpret approved requirements, redesign unrelated architecture, weaken tests to pass, fix unrelated failures, or implement future phases.
 
-- reinterpret approved requirements
-- redesign architecture without repository evidence
-- weaken tests merely to make them pass
-- fix unrelated failures
-- implement future phases
-- continue exploring after enough information exists to edit safely
+## Context and usage budget
 
-## Investigation discipline
+Optimize for **minimum sufficient repository context**. Broad exploration is expensive and is not the default.
 
-Inspect the minimum repository surface necessary.
+For an approved-plan build:
 
-Do not repeatedly:
+- start from files, symbols, and tests named by the plan;
+- do **not** begin with repository-wide `rg --files`, recursive globs, broad symbol scans, or architecture inventories;
+- before the first edit, prefer no more than **5 targeted file reads** unless a direct dependency requires more;
+- follow imports/callers only when needed to make the requested edit safely;
+- do not reread unchanged files or rerun unchanged diagnostics;
+- after two targeted checks fail to resolve a detail, stop and report the uncertainty instead of exploring indefinitely;
+- do not inspect unrelated plans, tests, adapters, or phases;
+- do not run a full test suite, full `ruff check src tests`, or full `mypy src tests` merely to discover unrelated failures;
+- do not dump large command outputs into context when a filtered/targeted command can answer the question;
+- prefer exact test node IDs, exact modules, changed-file Ruff checks, and changed/relevant-module Mypy checks;
+- broaden verification only when the approved plan explicitly requires it, a focused check reveals a cross-cutting risk, or the change genuinely affects a shared public contract.
 
-- read the same file
-- run the same diagnostic command
-- inspect the same API or type information
-- reconsider a conclusion already supported by evidence
+For planning/research, prefer at most **10 targeted file reads** before producing the initial plan. Explain why before exploring more broadly.
 
-A repeated command is allowed only when code changed, previous output was truncated, or the arguments or purpose are materially different.
+Repository evidence is primary. Use external documentation only when behavior depends on an external API/library/protocol/version that cannot be established locally; prefer official docs/source/specifications.
 
-If an implementation detail remains unresolved after two targeted checks, stop and report the uncertainty instead of looping.
+## Python and verification
 
-For planning work, do not begin with broad recursive globs such as `src/print_engineer/**/*`, `src/**/*.py`, or `**/*.py`. Follow imports and callers only when necessary. Prefer at most ten targeted file reads before producing the initial plan; explain before exploring more broadly.
-
-## Python environment
-
-Always use the project virtual environment. On Windows, use:
+Use the project virtual environment on Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe
-```
-
-Do not use system Python for project tests. Use project executables such as these when present:
-
-```powershell
 .\.venv\Scripts\ruff.exe
 .\.venv\Scripts\mypy.exe
 ```
 
-## Testing and verification
+Typical verification order:
 
-Run focused tests first. Typical verification order:
+1. Exact tests covering changed behavior
+2. Relevant test module/suite if justified
+3. Ruff on changed/relevant files
+4. Mypy on changed/relevant files/modules
+5. Broader regression suite only when justified
 
-1. Tests directly covering changed behavior
-2. Relevant module or unit suite
-3. Ruff on changed or relevant files
-4. Mypy on changed or relevant files
-5. Broader unit suite when justified
+Never claim a check passed unless it was executed. Classify failures as introduced, pre-existing/unrelated, environment/runtime, or unresolved. Do not automatically fix unrelated failures.
 
-Never claim a test passed unless it was actually executed. Never claim implementation is complete unless relevant tests and applicable static checks were run and the diff matches the requested scope.
+## Git and user changes
 
-When a test or check fails, investigate and classify it as:
-
-- introduced by the current change
-- pre-existing or unrelated
-- environment or runtime issue
-- unresolved
-
-Do not automatically fix unrelated failures. Do not change tests solely because production behavior makes an assertion inconvenient; establish the intended behavioral contract first. Do not trust prior agent summaries or Build-agent success claims without independent verification.
-
-## Git and working tree
-
-The working tree may contain unrelated user changes.
-
-Before implementation inspect:
-
-```powershell
-git status --short
-```
-
-After implementation inspect:
-
-```powershell
-git status --short
-git diff --stat
-git diff
-```
-
-Never revert, delete, reset, overwrite, or clean unrelated user changes. Modify only files required by the current task or approved plan. Report unexpected changed files.
+The working tree may contain unrelated user work. Never revert, delete, reset, overwrite, clean, stage, or modify unrelated changes. Modify only files required by the current task/approved plan and report unexpected changed files.
 
 ## Architecture
 
-Prefer extending existing abstractions over creating parallel systems. Before adding a file, class, protocol, model, or dependency:
-
-- verify an existing abstraction cannot reasonably contain the functionality
-- keep the public API surface minimal
-- avoid speculative refactoring
-
-Do not redesign working architecture merely because another structure appears cleaner.
+Prefer existing abstractions over parallel systems. Before adding a file, class, protocol, model, or dependency, verify an existing abstraction cannot reasonably contain the functionality. Keep public API surface minimal and avoid speculative refactoring.
 
 ## Printer safety
 
-Printer integrations require special care. Unless an explicitly approved plan says otherwise:
+Unless an explicitly approved plan says otherwise:
 
-- do not start, stop, pause, or resume a print
-- do not change temperatures or other printer state
-- do not publish MQTT commands
-- do not use the Bambu request topic
-- do not implement automatic printing
-- do not perform hardware actions
-- do not connect to physical hardware during unit tests
+- do not start, stop, pause, or resume a print;
+- do not change temperatures or printer state;
+- do not publish MQTT commands or use the Bambu request topic;
+- do not implement automatic printing;
+- do not perform physical-hardware actions;
+- do not connect to physical hardware during unit tests.
 
-Read-only printer status work may only connect, subscribe to or read telemetry, normalize status, and disconnect.
+Read-only printer status work may only connect, subscribe/read telemetry, normalize status, and disconnect. For the current Bambu A1 read-only work there must be **zero MQTT publish paths**. Do not introduce `pushall`, command signing, cloud MQTT, Bambu account login, camera access, FTPS, or printer discovery unless a later approved plan explicitly requires it.
 
-For the current Bambu A1 read-only increment there must be **zero MQTT publish paths**. Do not introduce `pushall`, command signing, cloud MQTT, Bambu account login, camera access, FTPS, or printer discovery unless explicitly approved in a later plan.
-
-## Hardware verification
-
-Unit tests must be hermetic and must not require a physical printer. Separate real-hardware checks clearly from automated verification, and never claim hardware behavior was verified unless the checks were actually performed. If hardware verification is requested, perform only explicitly approved operations.
+Hardware verification must remain separate from hermetic automated tests. Never claim hardware behavior was verified unless it actually was. Perform only explicitly approved hardware operations.
 
 ## MCP
 
-- Follow the existing MCP tool-group and `build_tools` pattern.
-- Keep read-only MCP tools read-only.
-- Preserve machine-readable `code`, `message`, and `details` in `PrinterError` and similar structured errors.
-- Do not redesign MCP registration architecture for a single tool.
+Follow the existing MCP tool-group and `build_tools` pattern. Keep read-only tools read-only. Preserve machine-readable `code`, `message`, and `details` in structured errors. Do not redesign MCP registration for one tool.
 
-## Recommendation system and Phase 3A.1
+## Recommendation scope
 
-Phase 3A.1 means **Print Configuration and Material Recommendation**, not model analysis. Model analysis with trimesh is existing functionality and is not the Phase 3A.1 goal.
-
-Phase 3A.1 includes:
-
-- print configuration
-- material class recommendation
-- local filament candidate discovery
-- filament compatibility
-- deterministic filament ranking
-- nozzle recommendation
-- process recommendation integration
-- optional grounded LLM explanation
-
-Phase 3A.1 is read-only. It must not connect to a physical printer, change printer state, modify slicer profiles, modify the 3D model, automatically slice unless explicitly requested by an approved feature, or implement Phase 3B.
-
-Do not fabricate slicer, profile, or material facts. Preserve the distinction between deterministic repository or profile evidence and LLM-generated narrative. Unknown values must remain unknown. Do not mutate slicer profiles or models unless explicitly required.
-
-Prefer extending these existing recommendation components over creating duplicates:
+Phase 3A.1 is **Print Configuration and Material Recommendation** and is read-only. Prefer extending the existing recommendation modules rather than duplicating them:
 
 - `src/print_engineer/recommendation/engine.py`
 - `src/print_engineer/recommendation/context.py`
@@ -229,35 +119,12 @@ Prefer extending these existing recommendation components over creating duplicat
 - `ProfileRepository`
 - `ProfileMaterializer`
 
-For Phase 3A.1, start with only those modules and inspect direct dependencies as required. Inspect relevant tests after understanding the implementation. Do not begin with a repository-wide glob.
+Do not fabricate slicer/profile/material facts. Keep deterministic evidence separate from LLM narrative. Unknown values remain unknown.
 
-## Scope boundaries
+Do not implement undefined future phases merely because they appear in roadmaps. Phase 3B, print history/learning, printer control, camera support, automatic slicing, and automatic printing are separate future increments unless explicitly approved.
 
-Do not implement undefined future phases merely because they appear in roadmaps. In particular, do not implement Phase 3B without explicit, approved requirements.
+## Review and definition of done
 
-Print history and learning, printer control, camera support, automatic slicing, and automatic printing are separate future increments unless an approved plan says otherwise.
+Review the actual diff against the approved plan. Verify tests/static-check claims independently when reviewing. Check lifecycle cleanup, error paths, configuration precedence, unintended state changes, and whether tests prove behavior rather than bypassing it with mocks.
 
-## Code review
-
-When reviewing code:
-
-- compare the actual diff against the approved plan
-- independently verify tests and static-check claims
-- verify tests prove behavior rather than merely exercising mocks that bypass it
-- inspect configuration precedence
-- inspect lifecycle cleanup and all error paths
-- inspect unintended state changes
-- distinguish new failures from pre-existing failures
-
-## Definition of done
-
-A task is complete only when:
-
-- requested or approved behavior is implemented
-- focused tests pass
-- relevant Ruff checks pass
-- relevant Mypy checks pass
-- the diff matches the approved scope
-- no unintended behavior was added
-- remaining unrelated failures are clearly reported
-- hardware behavior is not claimed without hardware evidence
+A task is done only when requested behavior is implemented, focused tests and relevant static checks pass, the diff matches scope, unintended behavior was not added, unrelated failures are reported, and hardware behavior is not claimed without evidence.

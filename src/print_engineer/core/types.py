@@ -17,6 +17,17 @@ class PrinterState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PrinterIssueSource(StrEnum):
+    HMS = "hms"
+    PRINT_ERROR = "print_error"
+
+
+@dataclass(frozen=True)
+class PrinterIssue:
+    source: PrinterIssueSource
+    code: str
+
+
 class PrintOutcome(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
@@ -56,6 +67,10 @@ class PrinterStatus:
     target_nozzle_temp: float | None = None
     progress: float | None = None
     ams: AMSInfo | None = None
+    current_layer: int | None = None
+    total_layers: int | None = None
+    remaining_time_minutes: int | None = None
+    issues: tuple[PrinterIssue, ...] = ()
 
 
 @dataclass(frozen=True)

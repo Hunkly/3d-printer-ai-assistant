@@ -17,6 +17,8 @@ from print_engineer.core.interfaces.printer import Printer
 from print_engineer.core.policy import PolicyDecision
 from print_engineer.core.types import (
     AMSInfo,
+    PrinterIssue,
+    PrinterIssueSource,
     PrinterState,
     PrinterStatus,
     Snapshot,
@@ -33,6 +35,8 @@ from print_engineer.errors import (
 
 _BAMBU_MQTT_PORT = 8883
 _BAMBU_MQTT_USERNAME = "bblp"
+_UINT32_MAX = 0xFFFFFFFF
+_PRINT_ERROR_MAX = 0x7FFFFFFF
 
 _GCODE_STATE_MAP: dict[str, PrinterState] = {
     "IDLE": PrinterState.IDLE,
@@ -72,6 +76,33 @@ def _remaining_time_or_none(value: Any) -> int | None:
     if type(value) is int and value >= 0:
         return value
     return None
+
+
+def _normalize_hms(value: Any) -> tuple[PrinterIssue, ...] | None:
+    """Normalize one complete HMS array, or reject it atomically."""
+    if not isinstance(value, list):
+        return None
+
+    issues: list[PrinterIssue] = []
+    for item in value:
+        if not isinstance(item, dict) or "attr" not in item or "code" not in item:
+            return None
+        attr = item["attr"]
+        code = item["code"]
+        if not (
+            type(attr) is int
+            and 0 <= attr <= _UINT32_MAX
+            and type(code) is int
+            and 0 <= code <= _UINT32_MAX
+        ):
+            return None
+        issues.append(
+            PrinterIssue(
+                source=PrinterIssueSource.HMS,
+                code=f"{attr:08X}{code:08X}",
+            )
+        )
+    return tuple(issues)
 
 
 def _normalize_ams(ams: Any) -> AMSInfo | None:
@@ -120,6 +151,8 @@ class _BambuStatusAccumulator:
         self._current_layer: int | None = None
         self._total_layers: int | None = None
         self._remaining_time_minutes: int | None = None
+        self._hms_issues: tuple[PrinterIssue, ...] = ()
+        self._print_error_issue: PrinterIssue | None = None
         self._report_applied = False
 
     @property
@@ -172,6 +205,26 @@ class _BambuStatusAccumulator:
             if remaining_time is not None:
                 self._remaining_time_minutes = remaining_time
 
+        if "hms" in print_obj:
+            hms_issues = _normalize_hms(print_obj["hms"])
+            if hms_issues is not None:
+                self._hms_issues = hms_issues
+
+        if "print_error" in print_obj:
+            print_error = print_obj["print_error"]
+            if (
+                type(print_error) is int
+                and 0 <= print_error <= _PRINT_ERROR_MAX
+            ):
+                self._print_error_issue = (
+                    None
+                    if print_error == 0
+                    else PrinterIssue(
+                        source=PrinterIssueSource.PRINT_ERROR,
+                        code=f"{print_error:08X}",
+                    )
+                )
+
     def _update_float(
         self, print_obj: dict[str, Any], field: str, attribute: str
     ) -> None:
@@ -204,6 +257,12 @@ class _BambuStatusAccumulator:
             current_layer=self._current_layer,
             total_layers=self._total_layers,
             remaining_time_minutes=self._remaining_time_minutes,
+            issues=self._hms_issues
+            + (
+                (self._print_error_issue,)
+                if self._print_error_issue is not None
+                else ()
+            ),
         )
 
 

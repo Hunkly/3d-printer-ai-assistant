@@ -69,6 +69,10 @@ def _serialize_status(status: PrinterStatus) -> dict[str, Any]:
         "current_layer": status.current_layer,
         "total_layers": status.total_layers,
         "remaining_time_minutes": status.remaining_time_minutes,
+        "issues": [
+            {"source": issue.source.value, "code": issue.code}
+            for issue in status.issues
+        ],
     }
 
 

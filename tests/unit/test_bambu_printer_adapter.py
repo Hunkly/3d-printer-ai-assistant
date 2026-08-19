@@ -17,7 +17,13 @@ import print_engineer.adapters.printer.bambu as bambu_module
 import print_engineer.adapters.printer.transport as transport_module
 from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
 from print_engineer.adapters.printer.transport import MqttConnectionError
-from print_engineer.core.types import PrinterState, PrinterStatus, TemperatureSetpoint
+from print_engineer.core.types import (
+    PrinterIssue,
+    PrinterIssueSource,
+    PrinterState,
+    PrinterStatus,
+    TemperatureSetpoint,
+)
 from print_engineer.errors import (
     PrinterAuthFailed,
     PrinterInvalidReport,
@@ -561,6 +567,191 @@ def test_full_status_preserves_existing_fields_with_remaining_time() -> None:
     assert status.ams == bambu_module.AMSInfo(is_connected=True, slots=["A1"])
     assert (status.current_layer, status.total_layers) == (10, 100)
     assert status.remaining_time_minutes == 139
+
+
+# --- Printer-reported issues -----------------------------------------------
+
+_HMS_A = {"attr": 0x03001234, "code": 0x00020056}
+_HMS_B = {"attr": 0x01020304, "code": 0x05060708}
+_HMS_C = {"attr": 0x11121314, "code": 0x15161718}
+_PRINT_ERROR_X = 0x0012ABCD
+_PRINT_ERROR_Y = 0x07654321
+
+
+def _hms_issue(item: dict[str, int]) -> PrinterIssue:
+    return PrinterIssue(
+        source=PrinterIssueSource.HMS,
+        code=f"{item['attr']:08X}{item['code']:08X}",
+    )
+
+
+def _print_error_issue(value: int) -> PrinterIssue:
+    return PrinterIssue(
+        source=PrinterIssueSource.PRINT_ERROR,
+        code=f"{value:08X}",
+    )
+
+
+def test_reported_issues_empty_defaults_and_explicit_clears() -> None:
+    status, _, _ = _status(
+        {"gcode_state": "IDLE", "hms": [], "print_error": 0}
+    )
+    assert status.issues == ()
+
+
+def test_hms_normalizes_raw_pair_order_and_duplicates() -> None:
+    status, _, _ = _status(
+        {"hms": [_HMS_A, _HMS_B, _HMS_A], "gcode_state": "IDLE"}
+    )
+    assert status.issues == (
+        PrinterIssue(PrinterIssueSource.HMS, "0300123400020056"),
+        _hms_issue(_HMS_B),
+        PrinterIssue(PrinterIssueSource.HMS, "0300123400020056"),
+    )
+
+
+def test_hms_missing_preserves_and_empty_clears() -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A]})
+    accumulator.apply({"mc_percent": 10})
+    assert accumulator.snapshot().issues == (_hms_issue(_HMS_A),)
+
+    accumulator.apply({"hms": []})
+    assert accumulator.snapshot().issues == ()
+
+
+def test_hms_malformed_item_rejects_update_atomically() -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A]})
+    accumulator.apply({"hms": [_HMS_B, {"attr": 1}, _HMS_C]})
+    assert accumulator.snapshot().issues == (_hms_issue(_HMS_A),)
+
+
+@pytest.mark.parametrize("raw", [None, {}, "bad", 1, (1, 2)])
+def test_malformed_hms_container_preserves_previous_state(raw: Any) -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A]})
+    accumulator.apply({"hms": raw})
+    assert accumulator.snapshot().issues == (_hms_issue(_HMS_A),)
+
+
+@pytest.mark.parametrize("item", [1, {"code": 1}, {"attr": 1}])
+def test_malformed_hms_entry_preserves_previous_state(item: Any) -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A]})
+    accumulator.apply({"hms": [item]})
+    assert accumulator.snapshot().issues == (_hms_issue(_HMS_A),)
+
+
+@pytest.mark.parametrize(
+    "raw", [True, False, -1, 0x100000000, 1.0, "1", None, [], {}]
+)
+@pytest.mark.parametrize("field", ["attr", "code"])
+def test_malformed_hms_component_preserves_previous_state(
+    field: str, raw: Any
+) -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A]})
+    item: dict[str, Any] = {"attr": 1, "code": 2}
+    item[field] = raw
+    accumulator.apply({"hms": [item]})
+    assert accumulator.snapshot().issues == (_hms_issue(_HMS_A),)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, ()),
+        (1, (PrinterIssue(PrinterIssueSource.PRINT_ERROR, "00000001"),)),
+        (
+            0x0012ABCD,
+            (PrinterIssue(PrinterIssueSource.PRINT_ERROR, "0012ABCD"),),
+        ),
+        (
+            0x7FFFFFFF,
+            (PrinterIssue(PrinterIssueSource.PRINT_ERROR, "7FFFFFFF"),),
+        ),
+    ],
+)
+def test_print_error_valid_domain(value: int, expected: tuple[PrinterIssue, ...]) -> None:
+    status, _, _ = _status({"gcode_state": "IDLE", "print_error": value})
+    assert status.issues == expected
+
+
+def test_print_error_missing_preserves_and_zero_clears() -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"print_error": _PRINT_ERROR_X})
+    accumulator.apply({"mc_percent": 10})
+    assert accumulator.snapshot().issues == (
+        _print_error_issue(_PRINT_ERROR_X),
+    )
+    accumulator.apply({"print_error": 0})
+    assert accumulator.snapshot().issues == ()
+
+
+@pytest.mark.parametrize(
+    "raw", [True, False, -1, 0x80000000, 1.0, "1", None, [], {}, (1,)]
+)
+def test_malformed_print_error_preserves_previous_state(raw: Any) -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"print_error": _PRINT_ERROR_X})
+    accumulator.apply({"print_error": raw})
+    assert accumulator.snapshot().issues == (
+        _print_error_issue(_PRINT_ERROR_X),
+    )
+
+
+@pytest.mark.parametrize(
+    ("incoming", "expected"),
+    [
+        (
+            {"hms": "malformed", "print_error": 0},
+            (_hms_issue(_HMS_A),),
+        ),
+        (
+            {"hms": [], "print_error": "malformed"},
+            (_print_error_issue(_PRINT_ERROR_X),),
+        ),
+        (
+            {"hms": [_HMS_B, _HMS_C], "print_error": _PRINT_ERROR_Y},
+            (
+                _hms_issue(_HMS_B),
+                _hms_issue(_HMS_C),
+                _print_error_issue(_PRINT_ERROR_Y),
+            ),
+        ),
+        (
+            {"hms": [_HMS_B]},
+            (_hms_issue(_HMS_B), _print_error_issue(_PRINT_ERROR_X)),
+        ),
+        (
+            {"print_error": _PRINT_ERROR_Y},
+            (_hms_issue(_HMS_A), _print_error_issue(_PRINT_ERROR_Y)),
+        ),
+    ],
+    ids=["case-a", "case-b", "case-c", "case-d", "case-e"],
+)
+def test_issue_sources_update_independently_within_report(
+    incoming: dict[str, Any], expected: tuple[PrinterIssue, ...]
+) -> None:
+    accumulator = bambu_module._BambuStatusAccumulator()
+    accumulator.apply({"hms": [_HMS_A], "print_error": _PRINT_ERROR_X})
+    accumulator.apply(incoming)
+    assert accumulator.snapshot().issues == expected
+
+
+def test_disconnect_reconnect_resets_reported_issues() -> None:
+    factory = _FakeFactory()
+    factory.payloads = [
+        _payload({"gcode_state": "IDLE", "hms": [_HMS_A]}),
+        _payload({"gcode_state": "IDLE"}),
+    ]
+    adapter = _make_adapter(factory=factory)
+    adapter.connect()
+    assert adapter.get_status().issues == (_hms_issue(_HMS_A),)
+    adapter.disconnect()
+    adapter.connect()
+    assert adapter.get_status().issues == ()
 
 
 # --- Temperatures ----------------------------------------------------------

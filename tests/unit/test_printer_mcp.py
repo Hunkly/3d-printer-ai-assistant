@@ -18,7 +18,13 @@ from fastmcp import Client
 from fastmcp.server.server import FastMCP
 
 from print_engineer.config import BambuSecrets, PrinterConfig, Settings
-from print_engineer.core.types import AMSInfo, PrinterState, PrinterStatus
+from print_engineer.core.types import (
+    AMSInfo,
+    PrinterIssue,
+    PrinterIssueSource,
+    PrinterState,
+    PrinterStatus,
+)
 from print_engineer.errors import (
     PrinterAuthFailed,
     PrinterError,
@@ -310,6 +316,7 @@ def test_printer_status_ok_serializes_all_fields(
     assert payload["status"]["current_layer"] == 10
     assert payload["status"]["total_layers"] == 100
     assert payload["status"]["remaining_time_minutes"] == 139
+    assert payload["status"]["issues"] == []
     assert payload["summary"] == (
         "Printing · 42% complete · Layer 10 / 100 · About 139 min remaining"
         " · Nozzle 220.5 / 220 °C · Bed 55 / 60 °C · AMS connected"
@@ -494,7 +501,41 @@ def test_disconnected_summary_suppresses_stale_fragments_without_mutation(
         "current_layer": 10,
         "total_layers": 100,
         "remaining_time_minutes": 20,
+        "issues": [],
     }
+
+
+def test_printer_status_serializes_opaque_issues_without_affecting_presentation(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=PrinterState.IDLE,
+        is_connected=True,
+        progress=1.0,
+        issues=(
+            PrinterIssue(PrinterIssueSource.HMS, "0300123400020056"),
+            PrinterIssue(PrinterIssueSource.HMS, "0102030405060708"),
+            PrinterIssue(PrinterIssueSource.PRINT_ERROR, "0012ABCD"),
+        ),
+    )
+
+    payload = _call_status(server)
+
+    assert payload["status"]["issues"] == [
+        {"source": "hms", "code": "0300123400020056"},
+        {"source": "hms", "code": "0102030405060708"},
+        {"source": "print_error", "code": "0012ABCD"},
+    ]
+    assert all(set(issue) == {"source", "code"} for issue in payload["status"]["issues"])
+    assert payload["status"]["progress"] == 1.0
+    assert payload["summary"] == "Idle"
+    assert payload["assessment"] == {
+        "level": "info",
+        "code": "printer_idle",
+        "message": "Printer is idle.",
+    }
+    assert len(fake_adapter.instances) == 1
+    assert fake_adapter.instances[0].get_status_calls == 1
 
 
 @pytest.mark.parametrize(

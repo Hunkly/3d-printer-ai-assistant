@@ -436,6 +436,26 @@ def test_full_status_summary_exact() -> None:
     )
 
 
+def test_paused_full_status_summary_keeps_active_job_fragments() -> None:
+    status = PrinterStatus(
+        state=PrinterState.PAUSED,
+        is_connected=True,
+        progress=0.73,
+        current_layer=184,
+        total_layers=252,
+        remaining_time_minutes=32,
+        nozzle_temp=220.03125,
+        target_nozzle_temp=220.0,
+        bed_temp=54.9375,
+        target_bed_temp=55.0,
+        ams=AMSInfo(is_connected=True, slots=["A1"]),
+    )
+    assert _format_status_summary(status) == (
+        "Paused · 73% complete · Layer 184 / 252 · About 32 min remaining"
+        " · Nozzle 220 / 220 °C · Bed 54.9 / 55 °C · AMS connected"
+    )
+
+
 def test_disconnected_summary_suppresses_stale_fragments_without_mutation(
     server: FastMCP, fake_adapter: type[_FakeAdapter]
 ) -> None:
@@ -518,15 +538,15 @@ def test_progress_summary_formatting(
 ) -> None:
     summary = _format_status_summary(
         PrinterStatus(
-            state=PrinterState.UNKNOWN,
+            state=PrinterState.PRINTING,
             is_connected=True,
             progress=progress,
         )
     )
     if fragment is None:
-        assert summary == "Status unknown"
+        assert summary == "Printing"
     else:
-        assert summary == f"Status unknown · {fragment}"
+        assert summary == f"Printing · {fragment}"
 
 
 @pytest.mark.parametrize(
@@ -588,6 +608,81 @@ def test_idle_summary_preserves_structured_remaining_time(
     payload = _call_status(server)
     assert payload["summary"] == "Idle"
     assert payload["status"]["remaining_time_minutes"] == 139
+
+
+def test_real_a1_idle_summary_suppresses_job_fragments_without_mutation(
+    server: FastMCP, fake_adapter: type[_FakeAdapter]
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=PrinterState.IDLE,
+        is_connected=True,
+        progress=1.0,
+        current_layer=80,
+        total_layers=80,
+        remaining_time_minutes=0,
+        nozzle_temp=27.3125,
+        target_nozzle_temp=0.0,
+        bed_temp=27.84375,
+        target_bed_temp=0.0,
+        ams=AMSInfo(is_connected=True),
+    )
+
+    payload = _call_status(server)
+
+    assert payload["summary"] == (
+        "Idle · Nozzle 27.3 / 0 °C · Bed 27.8 / 0 °C · AMS connected"
+    )
+    assert payload["status"]["progress"] == 1.0
+    assert payload["status"]["current_layer"] == 80
+    assert payload["status"]["total_layers"] == 80
+    assert payload["status"]["remaining_time_minutes"] == 0
+    assert payload["assessment"] == {
+        "level": "info",
+        "code": "printer_idle",
+        "message": "Printer is idle.",
+    }
+    assert len(fake_adapter.instances) == 1
+    assert fake_adapter.instances[0].get_status_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("state", "lead"),
+    [
+        (PrinterState.IDLE, "Idle"),
+        (PrinterState.ERROR, "Printer error"),
+        (PrinterState.UNKNOWN, "Status unknown"),
+        (PrinterState.OFFLINE, "Offline"),
+    ],
+)
+def test_non_active_state_summary_suppresses_job_fragments_only(
+    state: PrinterState,
+    lead: str,
+    server: FastMCP,
+    fake_adapter: type[_FakeAdapter],
+) -> None:
+    fake_adapter.status = PrinterStatus(
+        state=state,
+        is_connected=True,
+        progress=0.5,
+        current_layer=10,
+        total_layers=100,
+        remaining_time_minutes=20,
+        nozzle_temp=27.3125,
+        target_nozzle_temp=0.0,
+        bed_temp=27.84375,
+        target_bed_temp=0.0,
+        ams=AMSInfo(is_connected=True, slots=["A1"]),
+    )
+
+    payload = _call_status(server)
+
+    assert payload["summary"] == (
+        f"{lead} · Nozzle 27.3 / 0 °C · Bed 27.8 / 0 °C · AMS connected"
+    )
+    assert payload["status"]["progress"] == 0.5
+    assert payload["status"]["current_layer"] == 10
+    assert payload["status"]["total_layers"] == 100
+    assert payload["status"]["remaining_time_minutes"] == 20
 
 
 @pytest.mark.parametrize(
@@ -787,7 +882,8 @@ def test_successful_error_state_has_assessment(
 
     assert payload["ok"] is True
     assert payload["status"]["state"] == "error"
-    assert payload["summary"] == "Printer error · 50% complete"
+    assert payload["summary"] == "Printer error"
+    assert payload["status"]["progress"] == 0.5
     assert payload["assessment"] == {
         "level": "error",
         "code": "printer_error",

@@ -157,20 +157,31 @@ def _format_status_summary(status: PrinterStatus) -> str:
         return "Printer disconnected"
 
     fragments = [_STATE_SUMMARIES[status.state]]
+    active_job_state = status.state in {
+        PrinterState.PRINTING,
+        PrinterState.PAUSED,
+    }
 
-    if status.progress is not None and isfinite(status.progress):
+    if (
+        active_job_state
+        and status.progress is not None
+        and isfinite(status.progress)
+    ):
         display_progress = min(max(status.progress, 0.0), 1.0)
         percent = floor(display_progress * 100.0 + 0.5)
         fragments.append(f"{percent}% complete")
 
-    if status.current_layer is not None and status.total_layers is not None:
-        fragments.append(f"Layer {status.current_layer} / {status.total_layers}")
-    elif status.current_layer is not None:
-        fragments.append(f"Layer {status.current_layer}")
-    elif status.total_layers is not None:
-        fragments.append(f"Total layers {status.total_layers}")
+    if active_job_state:
+        if status.current_layer is not None and status.total_layers is not None:
+            fragments.append(
+                f"Layer {status.current_layer} / {status.total_layers}"
+            )
+        elif status.current_layer is not None:
+            fragments.append(f"Layer {status.current_layer}")
+        elif status.total_layers is not None:
+            fragments.append(f"Total layers {status.total_layers}")
 
-    if status.state in {PrinterState.PRINTING, PrinterState.PAUSED}:
+    if active_job_state:
         if status.remaining_time_minutes is not None:
             fragments.append(
                 f"About {status.remaining_time_minutes} min remaining"

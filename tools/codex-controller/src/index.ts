@@ -1,15 +1,26 @@
 import { Codex } from "@openai/codex-sdk";
 import type { ThreadEvent, ThreadItem } from "@openai/codex-sdk";
+import { parseProviderMode, parseReviewTarget, primaryEnvironment, fallbackEnvironment, openRouterConfig, PREFERRED_MODEL, selectOpenRouter,defaultProvenanceOps,runBuildProducer,runPlanProducer,isFallbackIsolationError,type FallbackIsolation } from "./core.js";
+import { readPrimaryStatus } from "./codex-app-server-client.js";
+import { decideProvider, statusLines } from "./provider-decision.js";
+import {SdkCodexExecutor,type CodexExecutor,type ExecutionResult} from "./codex-executor.js";
+import {isCompatibilityProbeRateLimited} from "./compatibility-probe.js";
+import type {PrimaryStatus} from "./provider-decision.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 interface TaskState {
+  schemaVersion?: 2;
   threadId: string;
   branch: string;
   worktree?: string;
   issueNumber?: number;
   prUrl?: string;
+  providerMode?: "primary" | "openrouter-free";
+  modelIdentity?: string;
+  role?: string;
 }
 
 interface ControllerState {
@@ -24,6 +35,76 @@ interface GitHubIssue {
   url: string;
 }
 
+type CodexPhase = "general" | "plan" | "build" | "review";
+type ThreadMode = "resume" | "fresh";
+
+const VALID_PHASES: CodexPhase[] = ["general", "plan", "build", "review"];
+const VALID_THREAD_MODES: ThreadMode[] = ["resume", "fresh"];
+
+function parsePhase(value: string | undefined): CodexPhase {
+  const normalized = value?.trim().toLowerCase() || "general";
+  if (!VALID_PHASES.includes(normalized as CodexPhase)) {
+    throw new Error(`CODEX_PHASE must be one of: ${VALID_PHASES.join(", ")}.`);
+  }
+  return normalized as CodexPhase;
+}
+
+function parseThreadMode(value: string | undefined, phase: CodexPhase): ThreadMode {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return phase === "review" ? "fresh" : "resume";
+  if (!VALID_THREAD_MODES.includes(normalized as ThreadMode)) {
+    throw new Error(`CODEX_THREAD_MODE must be one of: ${VALID_THREAD_MODES.join(", ")}.`);
+  }
+  if (phase === "review" && normalized === "resume") {
+    throw new Error("Review and plan approval require CODEX_THREAD_MODE=fresh.");
+  }
+  return normalized as ThreadMode;
+}
+
+function phaseInstructions(phase: CodexPhase): string[] {
+  switch (phase) {
+    case "plan":
+      return [
+        "PLAN / RESEARCH MODE.",
+        "Inspect only the repository evidence needed for the requested plan/research and prefer the AGENTS.md planning context budget.",
+        "Do not implement production behavior. Modify only planning/documentation files explicitly allowed by the task.",
+        "Do not run tests, Ruff, or Mypy as routine verification; run a targeted check only to establish a factual planning claim or when the task explicitly requires it.",
+      ];
+    case "build":
+      return [
+        "BUILD MODE.",
+        "If an APPROVED plan is supplied, treat it as the implementation contract and do not plan again.",
+        "Inspect only plan-named files and necessary direct dependencies. Use focused verification: exact/relevant tests and Ruff/Mypy on changed/relevant files as required by AGENTS.md or the plan.",
+        "Do not run broad/full suites merely to search for unrelated failures. Broaden only when the plan requires it or a focused result proves broader risk. Stop when the approved increment is complete.",
+      ];
+    case "review":
+      return [
+        "INDEPENDENT REVIEW MODE.",
+        "Independently inspect the actual diff/implementation against the approved contract; do not trust Build-agent claims as evidence.",
+        "Do not implement fixes unless the task explicitly authorizes a narrowly defined review-only change. Inspect only the approved scope, relevant diff, and necessary dependencies.",
+        "Independently run focused verification when the review contract needs it; do not automatically run a full unit suite or reopen settled architecture without an actual contradiction. Classify findings and stop.",
+      ];
+    case "general":
+      return [
+        "GENERAL MODE.",
+        "Stay narrowly scoped and perform verification appropriate to the actual task. Do not automatically run tests, Ruff, or Mypy when the task does not require them.",
+      ];
+  }
+}
+
+function buildCodexPrompt(task: string, phase: CodexPhase): string {
+  return [
+    "Follow the repository AGENTS.md execution contract.",
+    "Work only on the task below. Do not push, merge, commit, or open a pull request; the controller owns Git publication.",
+    "Start from files/plans named in the task. Avoid broad repository inspection and follow direct dependencies only as needed.",
+    "Inspect git status before editing when editing is possible.",
+    "At the end, report what changed and verification performed; when files may have changed, inspect git status, git diff --stat, and the task-relevant diff.",
+    ...phaseInstructions(phase),
+    "",
+    `Task: ${task}`,
+  ].join("\n");
+}
+
 function run(command: string, args: string[], cwd?: string): string {
   return execFileSync(command, args, {
     cwd,
@@ -35,6 +116,8 @@ function run(command: string, args: string[], cwd?: string): string {
 function git(repo: string, ...args: string[]): string {
   return run("git", ["-C", repo, ...args]);
 }
+function validateExistingLinkedWorktree(worktree:string,env:NodeJS.ProcessEnv=process.env){if(!existsSync(worktree))throw new Error("INVALID_WORKTREE");const top=resolve(git(worktree,"rev-parse","--show-toplevel")),gitDir=resolve(git(worktree,"rev-parse","--path-format=absolute","--git-dir")),common=resolve(git(worktree,"rev-parse","--path-format=absolute","--git-common-dir"));if(top!==resolve(worktree)||gitDir===common)throw new Error("INVALID_WORKTREE");const repo=resolve(env.CODEX_REPO??"../..");if(resolve(git(repo,"rev-parse","--path-format=absolute","--git-common-dir"))!==common)throw new Error("INVALID_WORKTREE");for(const secret of [".env",".env.local","config/config.local.yaml"])if(existsSync(resolve(worktree,...secret.split("/"))))throw new Error("SECRET_FILE_PRESENT");return worktree;}
+function fallbackTask(worktree:string,env:NodeJS.ProcessEnv=process.env){const value=env.MODEL_TASK_FILE;if(!value?.trim())throw new Error("INVALID_TASK_FILE");const path=resolve(worktree,value);const bytes=readFileSync(path);if(!bytes.length||bytes.length>262144||bytes.subarray(0,3).equals(Buffer.from([239,187,191])))throw new Error("INVALID_TASK_FILE");const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);if(!text.trim())throw new Error("INVALID_TASK_FILE");return text;}
 
 function gh(repo: string, ...args: string[]): string {
   return run("gh", args, repo);
@@ -246,8 +329,12 @@ function printEvent(event: ThreadEvent): string | null {
       printUpdatedItem(event.item);
       return null;
     case "turn.completed":
+      const uncachedInputTokens = Math.max(
+        event.usage.input_tokens - event.usage.cached_input_tokens,
+        0
+      );
       console.log(
-        `[codex] turn completed; input=${event.usage.input_tokens}, cached=${event.usage.cached_input_tokens}, output=${event.usage.output_tokens}`
+        `[codex] turn completed; input=${event.usage.input_tokens}, cached=${event.usage.cached_input_tokens}, uncached=${uncachedInputTokens}, output=${event.usage.output_tokens}`
       );
       return null;
     case "turn.failed":
@@ -257,57 +344,74 @@ function printEvent(event: ThreadEvent): string | null {
   }
 }
 
-async function runCodexTask(
+export async function runNormalFallbackExecution(
+  phase: CodexPhase,
+  executor: CodexExecutor,
+  model: string,
+  workingDirectory: string,
+  prompt: string,
+  env: NodeJS.ProcessEnv = process.env,
+  resumeId?: string,
+  isolation: FallbackIsolation = {}
+): Promise<ExecutionResult> {
+  return executor.execute(
+    {config: openRouterConfig(), env: fallbackEnvironment(env, isolation)},
+    {workingDirectory, model},
+    prompt,
+    resumeId
+  );
+}
+
+export async function runCodexTask(
   taskKey: string,
   task: string,
   workingDirectory: string,
   branch: string,
   state: ControllerState,
-  statePath: string
+  statePath: string,
+  phase: CodexPhase,
+  threadMode: ThreadMode,
+  providerMode: "primary"|"openrouter-free",
+  modelIdentity: string,
+  executor?: CodexExecutor,
+  isolation: FallbackIsolation = {}
 ): Promise<string> {
-  const codex = new Codex();
   const existing = state.threads[taskKey];
-  const thread = existing
-    ? codex.resumeThread(existing.threadId, { workingDirectory })
-    : codex.startThread({ workingDirectory });
+  const shouldResume = threadMode === "resume" && phase !== "review" && existing !== undefined && existing.schemaVersion===2 && existing.providerMode===providerMode && existing.modelIdentity===modelIdentity && existing.role===phase && existing.worktree===workingDirectory;
+  let thread:any;
 
-  const prompt = [
-    "Follow the repository AGENTS.md execution contract.",
-    "Work only on the task below. Do not push, merge, commit, or open a pull request; the controller owns Git publication.",
-    "Do not inspect the whole repository unless the task genuinely requires it. Start from the files/plans named in the task and follow direct dependencies only as needed.",
-    "Inspect git status before editing. Run focused tests and applicable Ruff/Mypy checks required by AGENTS.md.",
-    "At the end, inspect git status, git diff --stat, and git diff, then report what changed and verification results.",
-    "",
-    `Task: ${task}`,
-  ].join("\n");
+  const prompt = buildCodexPrompt(task, phase);
 
-  console.log(`[controller] task=${taskKey} branch=${branch}`);
+  console.log(`[controller] task=${taskKey} branch=${branch} phase=${phase} thread=${threadMode} provider=${providerMode} model=${modelIdentity}`);
   console.log(`[controller] worktree=${workingDirectory}`);
   console.log("[controller] starting Codex stream...");
-
-  const { events } = await thread.runStreamed(prompt);
   let finalResponse = "";
+  const execute=async()=>{if(providerMode === "primary"){const codex = new Codex({env:primaryEnvironment(process.env)});thread = shouldResume ? codex.resumeThread(existing!.threadId, { workingDirectory, model:modelIdentity }) : codex.startThread({ workingDirectory, model:modelIdentity });const {events}=await thread.runStreamed(prompt);for await(const event of events){const response=printEvent(event);if(response!==null)finalResponse=response;}}else{const result=await runNormalFallbackExecution(phase,executor??new SdkCodexExecutor(),modelIdentity,workingDirectory,prompt,process.env,shouldResume?existing!.threadId:undefined,isolation);thread={id:result.threadId};for(const event of result.events){const response=printEvent(event);if(response!==null)finalResponse=response;}}};
+  if(providerMode==="openrouter-free"&&(phase==="plan"||phase==="build")){const {computeWorktreeStateHash,provenancePaths}=await import("@print-engineer/openrouter-free-selector");const planPath=process.env.MODEL_PLAN_PATH;if(!planPath)throw new Error("INVALID_PLAN_PATH");const canonical=planPath.replaceAll("\\","/");const paths=provenancePaths(workingDirectory,canonical);const ops=await defaultProvenanceOps(workingDirectory,canonical,paths,execute,()=>computeWorktreeStateHash(workingDirectory));if(phase==="plan")await runPlanProducer(modelIdentity,ops);else await runBuildProducer(modelIdentity,ops);}else await execute();
 
-  for await (const event of events) {
-    const response = printEvent(event);
-    if (response !== null) {
-      finalResponse = response;
-    }
-  }
-
-  if (!existing) {
+  const shouldPersist = !shouldResume && !(phase === "review" && threadMode === "fresh");
+  if (shouldPersist) {
     const threadId = thread.id;
     if (!threadId) {
       throw new Error("Codex did not return a persistent thread ID; cannot save resumable task state.");
     }
-    state.threads[taskKey] = { threadId, branch, worktree: workingDirectory };
+    state.threads[taskKey] = {
+      ...existing,
+      schemaVersion:2,
+      threadId,
+      branch,
+      worktree: workingDirectory,
+      providerMode,
+      modelIdentity,
+      role:phase,
+    };
     saveState(statePath, state);
   }
 
   return finalResponse;
 }
 
-async function runGitHubIssueMode(repo: string, issueNumber: number, base: string, statePath: string): Promise<void> {
+async function runGitHubIssueMode(repo: string, issueNumber: number, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode, providerMode:"primary"|"openrouter-free",modelIdentity?:string): Promise<void> {
   assertGitHubCli(repo);
   const repository = process.env.CODEX_GITHUB_REPO ?? getRepositoryName(repo);
   const issue = readIssue(repo, repository, issueNumber);
@@ -316,10 +420,12 @@ async function runGitHubIssueMode(repo: string, issueNumber: number, base: strin
   const worktreeRoot = resolve(process.env.CODEX_WORKTREE_ROOT ?? "../../../.codex-worktrees");
   const state = loadState(statePath);
   const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
+  if(providerMode==="openrouter-free")validateExistingLinkedWorktree(worktree);
   const baselineUntracked = listUntracked(worktree);
+  modelIdentity ??= (await fallbackSelection(worktree,phase)).modelId;
 
-  const task = [`GitHub issue #${issue.number}: ${issue.title}`, "", issue.body].join("\n");
-  const finalResponse = await runCodexTask(taskKey, task, worktree, branch, state, statePath);
+  const task = providerMode==="openrouter-free"?fallbackTask(worktree):[`GitHub issue #${issue.number}: ${issue.title}`, "", issue.body].join("\n");
+  const finalResponse = await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity);
 
   stageCodexChanges(worktree, baselineUntracked);
   const commit = commitAndPush(worktree, branch, issue.title);
@@ -341,10 +447,10 @@ async function runGitHubIssueMode(repo: string, issueNumber: number, base: strin
   console.log(`[controller] draft PR: ${prUrl}`);
 }
 
-async function runManualMode(repo: string, base: string, statePath: string): Promise<void> {
+async function runManualMode(repo: string, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode,providerMode:"primary"|"openrouter-free",modelIdentity?:string): Promise<void> {
   const taskKey = process.env.CODEX_TASK_KEY;
-  const task = process.env.CODEX_TASK;
-  if (!taskKey || !task) {
+  const configuredTask = process.env.CODEX_TASK;
+  if (!taskKey || (providerMode==="primary"&&!configuredTask)) {
     throw new Error(
       "Set CODEX_ISSUE_NUMBER for GitHub mode, or CODEX_TASK_KEY and CODEX_TASK for manual mode."
     );
@@ -353,28 +459,25 @@ async function runManualMode(repo: string, base: string, statePath: string): Pro
   const branch = `codex/${taskKey}`;
   const worktreeRoot = resolve(process.env.CODEX_WORKTREE_ROOT ?? "../../../.codex-worktrees");
   const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
+  if(providerMode==="openrouter-free")validateExistingLinkedWorktree(worktree);
+  modelIdentity ??= (await fallbackSelection(worktree,phase)).modelId;
+  const task=providerMode==="openrouter-free"?fallbackTask(worktree):configuredTask!;
   const state = loadState(statePath);
-  await runCodexTask(taskKey, task, worktree, branch, state, statePath);
+  await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity);
 }
 
+async function fallbackSelection(worktree:string,phase:CodexPhase,env:NodeJS.ProcessEnv=process.env,fetcher:typeof fetch=fetch,registryPath=resolve("../openrouter-free-selector/config/codex-compatible-free-models-v1.json")){const {canonicalPlanPath,computeWorktreeStateHash,provenancePaths,readPlanArtifact}=await import("@print-engineer/openrouter-free-selector");const key=env.OPENROUTER_API_KEY;if(!key?.trim())throw new Error("OPENROUTER_AUTH_MISSING");const target=parseReviewTarget(env.CODEX_REVIEW_TARGET);if(phase==="review"&&!target)throw new Error("INVALID_REVIEW_TARGET");const planPath=env.MODEL_PLAN_PATH;let plan,paths;if(phase!=="general"){if(!planPath)throw new Error("INVALID_PLAN_PATH");const canonical=canonicalPlanPath(worktree,planPath);const status=phase==="plan"||target==="plan"?"PROPOSED":"APPROVED";if(phase!=="plan")plan=readPlanArtifact(worktree,canonical,status);paths=provenancePaths(worktree,plan?.canonical??canonical);}const override=phase==="plan"?env.MODEL_PLAN:phase==="build"?env.MODEL_BUILD:target==="plan"?env.MODEL_PLAN_REVIEW:env.MODEL_REVIEW;return selectOpenRouter({phase,reviewTarget:target,key,fetcher,registryPath,plan,planProducerPath:paths?.plan,buildProducerPath:paths?.build,stateHash:phase==="review"&&target==="implementation"?computeWorktreeStateHash(worktree):undefined,override});}
+async function resolveExecutionProvider(mode:ReturnType<typeof parseProviderMode>){const status=mode==="openrouter-free"?undefined:await readPrimaryStatus();const provider=mode==="openrouter-free"?mode:decideProvider(mode,status!);return {provider,model:provider==="primary"?PREFERRED_MODEL:undefined};}
+export interface ControllerDispatchDependencies {fetcher:typeof fetch;executor?:CodexExecutor;readPrimaryStatus?:()=>Promise<PrimaryStatus>;validateWorktree?:(worktree:string)=>string;gitStatus?:(worktree:string)=>string;selectFallback?:(worktree:string,phase:CodexPhase,env:NodeJS.ProcessEnv)=>Promise<any>;registryPath?:string;isolation?:FallbackIsolation}
+export async function dispatchControllerCommand(flags:string[],env:NodeJS.ProcessEnv=process.env,deps:ControllerDispatchDependencies={fetcher:fetch}):Promise<string[]|undefined>{if(flags.some(x=>!["--provider-status","--select-only","--compatibility-probe"].includes(x))||new Set(flags).size!==flags.length||flags.length>1)throw new Error("INVALID_COMMAND");const providerMode=parseProviderMode(env.CODEX_PROVIDER_MODE);const readStatus=deps.readPrimaryStatus??(()=>readPrimaryStatus());if(flags[0]==="--provider-status"){const status=providerMode==="openrouter-free"?undefined:await readStatus();const key=Boolean(env.OPENROUTER_API_KEY?.trim());const lines=statusLines(providerMode,status,key);if(providerMode==="primary")decideProvider(providerMode,status!);return lines;}if(flags[0]==="--compatibility-probe"){try{const {executeCompatibilityProbe,safeProbeLines}=await import("./compatibility-probe.js");if(!env.MODEL_WORKDIR)throw 0;const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));const report=await executeCompatibilityProbe(env,worktree,{fetcher:deps.fetcher,executor:deps.executor??new SdkCodexExecutor(),gitStatus:deps.gitStatus??(w=>git(w,"status","--short")),now:()=>new Date(),isolation:deps.isolation});return safeProbeLines(report);}catch(error){if(isFallbackIsolationError(error)||isCompatibilityProbeRateLimited(error))throw error;throw new Error("COMPATIBILITY_PROBE_FAILED");}}if(flags[0]==="--select-only"){if(providerMode!=="openrouter-free")throw new Error("SELECT_ONLY_REQUIRES_OPENROUTER_FREE");if(!env.MODEL_WORKDIR)throw new Error("INVALID_WORKTREE");const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));fallbackTask(worktree,env);const phase=parsePhase(env.CODEX_PHASE);const selected=deps.selectFallback?await deps.selectFallback(worktree,phase,env):await fallbackSelection(worktree,phase,env,deps.fetcher,deps.registryPath);return [`selector_source=openrouter`,`role=${selected.role}`,`model=${selected.modelId}`,`verified_free=true`,`context_length=${Math.min(selected.record.context_length,Number(selected.record.top_provider?.context_length))}`,`selection_mode=${selected.selectionMode}`];}return undefined;}
+
+export async function runControllerCli(flags:string[],env:NodeJS.ProcessEnv,deps:ControllerDispatchDependencies={fetcher:fetch},writeLine:(line:string)=>void=console.log,writeError:(line:string)=>void=console.error):Promise<number>{try{const dispatched=await dispatchControllerCommand(flags,env,deps);if(dispatched){for(const line of dispatched)writeLine(line);}return 0;}catch(error){const message=error instanceof Error?error.message:"CONTROLLER_FAILED";writeError(/^[A-Z][A-Z0-9_]*$/.test(message)?message:"COMPATIBILITY_PROBE_FAILED");return 1;}}
 async function main(): Promise<void> {
-  const repo = resolve(process.env.CODEX_REPO ?? "../..");
-  const base = process.env.CODEX_BASE_BRANCH ?? "master";
-  const statePath = resolve(process.env.CODEX_STATE ?? ".codex/controller-state.json");
-  const issueValue = process.env.CODEX_ISSUE_NUMBER;
-
-  if (issueValue) {
-    const issueNumber = Number(issueValue);
-    if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-      throw new Error("CODEX_ISSUE_NUMBER must be a positive integer.");
-    }
-    await runGitHubIssueMode(repo, issueNumber, base, statePath);
-  } else {
-    await runManualMode(repo, base, statePath);
-  }
+  process.exitCode=await runControllerCli(process.argv.slice(2),process.env,{fetcher:fetch});
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
+if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href)main().catch((error: unknown) => {
+  const message=error instanceof Error?error.message:"CONTROLLER_FAILED";
+  console.error(/^[A-Z][A-Z0-9_]*$/.test(message)?message:"CONTROLLER_FAILED");
   process.exitCode = 1;
 });

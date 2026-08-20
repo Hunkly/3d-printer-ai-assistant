@@ -1,0 +1,5 @@
+import test from "node:test";import assert from "node:assert/strict";import {selectFirstEligible,roleForPhase} from "../src/index.js";
+const m=(id:string,price="0")=>({id,pricing:{prompt:price,completion:"0",request:"0"},architecture:{input_modalities:["text"],output_modalities:["text"]},context_length:40000,top_provider:{context_length:40000},supported_parameters:["tools"]});
+test("server order first eligible and exclusions",()=>{assert.equal(selectFirstEligible([m("a/a:free","1"),m("b/b:free"),m("c/c:free")],"plan").modelId,"b/b:free");assert.equal(selectFirstEligible([m("b/b:free"),m("c/c:free")],"review",new Set(["b/b:free"])).modelId,"c/c:free")});
+test("roles are exact",()=>{assert.equal(roleForPhase("review","plan"),"plan-review");assert.throws(()=>roleForPhase("review"))});
+test("override remains subject to qualification and exclusion",()=>{assert.equal(selectFirstEligible([m("a/a:free"),m("b/b:free")],"build",new Set(),"b/b:free").modelId,"b/b:free");assert.throws(()=>selectFirstEligible([m("b/b:free")],"build",new Set(["b/b:free"]),"b/b:free"));assert.throws(()=>selectFirstEligible([m("b/b:free","1")],"build",new Set(),"b/b:free"))});

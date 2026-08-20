@@ -7,14 +7,18 @@
     "node": ">=18"
   },
   "scripts": {
+    "prebuild": "npm --prefix ../openrouter-free-selector run build",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "pretest": "npm run build",
+    "test": "node --test dist/test/core.test.js dist/test/codex-app-server-client.test.js dist/test/provider-decision.test.js dist/test/provider-flow.test.js dist/test/compatibility-probe.test.js",
+    "start": "node dist/src/index.js"
   },
   "dependencies": {
-    "@openai/codex-sdk": "latest"
+    "@openai/codex-sdk": "0.147.0",
+    "@print-engineer/openrouter-free-selector": "file:../openrouter-free-selector"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "typescript": "latest"
+    "@types/node": "26.2.0",
+    "typescript": "7.0.2"
   }
 }

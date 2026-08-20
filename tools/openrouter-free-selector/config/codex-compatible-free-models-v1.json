@@ -1,1 +1,13 @@
-{"schema_version":1,"entries":[]}
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "model_id": "nvidia/nemotron-3.5-lightning:free",
+      "codex_sdk_version": "0.147.0",
+      "provider_id": "openrouter",
+      "wire_api": "responses",
+      "validated_at": "2026-08-20T17:32:10.368Z",
+      "valid_until": "2026-09-19T17:32:10.368Z"
+    }
+  ]
+}

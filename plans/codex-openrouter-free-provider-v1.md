@@ -842,6 +842,969 @@ wrong-model, or otherwise uncorrelated evidence remains
 `COMPATIBILITY_PROBE_FAILED`; text containing `429` without structured status
 must fail rather than become rate limited.
 
+### Exact-Current-Thread Rollout Success Recovery Correction
+
+Status: APPROVED — implementation is authorized under this approved plan and remains limited to the correction defined below.
+
+Two historical exact persisted Codex rollouts demonstrated the success-side
+SDK mapping false-negative:
+
+- nvidia/nemotron-3.5-lightning:free
+  thread=01a01f2a-3c7c-7163-bbeb-c377d6b1e50b
+  Exact rollout showed provider=openrouter, exact intended model,
+  shell_command targeting AGENTS.md, matching function_call_output,
+  command exit code 0, non-empty assistant response after the tool,
+  task_complete with error absent, and non-empty last_agent_message.
+
+- google/gemma-4-26b-a4b-it:free
+  thread=01a01f28-3efd-7533-83cc-1e3a194d0d62
+  Exact rollout showed the same successful contract, with multiple AGENTS.md
+  tool calls.
+
+Both probes nevertheless returned COMPATIBILITY_PROBE_FAILED.
+
+These historical rollouts are diagnostic evidence only.
+Neither model may be registered from this historical evidence.
+A NEW successful compatibility probe is still required.
+
+The existing statement that rollout inspection can never declare SUCCESS is
+amended only for the narrow recovery defined below.
+Existing terminal-failure / 429 classification remains unchanged.
+
+1. SCOPE BOUNDARY
+
+Recovery applies ONLY to manual --compatibility-probe.
+
+It must not affect:
+- normal PLAN;
+- plan approval;
+- BUILD;
+- REVIEW;
+- provenance;
+- provider execution;
+- normal thread continuation;
+- ordinary execution success/failure semantics.
+
+Rollout recovery supplements only missing SDK-mapped execution-success
+evidence.
+
+The overall compatibility probe must still satisfy all 12 conditions in
+"Probe Success and Safe Report".
+
+Rollout success recovery may supply only the missing SDK-mapped execution
+evidence for the exact current thread:
+- fresh-thread/session evidence;
+- successful AGENTS.md tool-loop evidence;
+- absence of terminal provider/protocol failure;
+- final completion.
+
+All non-rollout conditions remain authoritative through their existing
+mechanisms, including:
+- verified-free qualification;
+- immediate exact-model zero-cost preflight;
+- configured provider/model identity;
+- post-probe worktree equality;
+- no Git publication;
+- no hardware access.
+
+Rollout evidence must never be used to re-prove, replace, or bypass those
+surrounding gates.
+
+2. SDK SUCCESS PREFERENCE
+
+Normal SDK-derived COMPATIBILITY_PROBE_SUCCESS remains preferred.
+
+If SDK evidence already proves SUCCESS, rollout success recovery is not used.
+
+3. NORMAL EXECUTIONRESULT REQUIRED
+
+Rollout SUCCESS recovery is allowed ONLY when executor.execute(...) returned
+normally with an ExecutionResult and the normal SDK evaluator would otherwise
+false-negative as COMPATIBILITY_PROBE_FAILED.
+
+4. TERMINAL FAILURE PRECEDENCE
+
+If executor.execute(...) throws any terminal error, rollout SUCCESS recovery
+is FORBIDDEN.
+
+- trustworthy structured 429 -> preserve existing RATE_LIMITED behavior;
+- other terminal failure -> FAILED;
+- a successful-looking rollout can NEVER override a thrown executor/SDK
+  failure.
+
+5. EXACT CURRENT THREAD
+
+The thread ID must come from the current normal ExecutionResult.threadId.
+
+Missing exact current thread ID -> FAILED.
+
+Forbidden discovery:
+- newest/latest rollout;
+- mtime selection;
+- worktree-global selection;
+- repository-global selection;
+- model-only selection;
+- provider-only selection.
+
+6. REUSE HARDENED CORRELATION
+
+Reuse the existing rollout correlation implementation/boundary rather than
+creating a weaker second discovery mechanism.
+
+Require:
+- validated isolated OpenRouter CODEX_HOME only;
+- exact unique current thread/session;
+- provider exactly openrouter;
+- cwd exactly the intended linked worktree;
+- exact intended model;
+- unambiguous session metadata;
+- exactly one matching exact-session rollout;
+- symlink/junction escape rejection;
+- component-safe path containment;
+- missing/corrupt/unreadable evidence fails closed.
+
+7. RECOVERED SUCCESS EVIDENCE
+
+Recovered SUCCESS must prove ALL of the following execution evidence.
+
+A. AGENTS.md shell command
+
+Require a persisted Responses:
+
+type=function_call
+name=shell_command
+
+whose parsed command targets AGENTS.md.
+
+Assistant prose is not tool evidence.
+
+Extra tool calls are allowed.
+
+Multiple AGENTS.md calls are allowed if at least one qualifying call/output
+pair succeeds and all other predicates pass.
+
+B. Exact matching output
+
+The qualifying function_call must have:
+
+type=function_call_output
+
+with exactly the same call_id.
+
+Unrelated outputs cannot satisfy the requirement.
+
+C. Canonical exit code exactly 0
+
+The matching tool output must prove shell exit code exactly 0 using the actual
+canonical persisted Codex shell-result envelope.
+
+Arbitrary stdout containing text such as:
+
+Process exited with code 0
+
+must NOT count as execution metadata.
+
+If BUILD cannot reliably distinguish Codex-generated exit metadata from
+command stdout using the actual persisted format, BUILD must STOP as BLOCKED.
+
+Do not guess or weaken this rule.
+
+D. Post-tool assistant completion
+
+Require a non-empty assistant response AFTER the qualifying successful
+function_call_output.
+
+Persisted forms may include:
+- response_item / message / role=assistant;
+- event_msg / agent_message.
+
+Assistant text only before the tool is insufficient.
+
+E. Successful terminal task_complete
+
+Require an unambiguous persisted:
+
+event_msg
+payload.type=task_complete
+
+task_complete.error must be absent or null.
+
+Missing task_complete -> FAILED.
+
+Conflicting task_complete records -> FAILED.
+
+Any terminal failure prevents SUCCESS.
+
+F. Exact last_agent_message correlation
+
+When task_complete.last_agent_message is present:
+
+- it must be a non-empty string;
+- identify the final non-empty assistant response occurring after the
+  qualifying function_call_output;
+- if response_item/message and event_msg/agent_message representations both
+  exist for that final response, they must agree;
+- task_complete.last_agent_message must exactly equal the final assistant text;
+- no whitespace normalization;
+- no substring matching;
+- no fuzzy matching;
+- no semantic matching;
+- disagreement fails closed.
+
+If last_agent_message is absent but predicate D independently proves the final
+post-tool assistant response, absence alone does not prevent eligibility.
+
+G. Worktree unchanged
+
+Worktree equality remains proven only by the existing pre/post
+git status --short mechanism.
+
+The post-probe worktree state must exactly equal the pre-probe state.
+
+Mutation -> COMPATIBILITY_PROBE_FAILED.
+
+Worktree equality is never recoverable from rollout evidence.
+
+8. EXISTING 429 ARCHITECTURE PRESERVED
+
+Preserve exactly:
+- structured 429 only;
+- no plain-text 429 classification;
+- exact-thread rollout correlation;
+- provider/worktree/model exact correlation;
+- session uniqueness;
+- isolated CODEX_HOME;
+- filesystem containment;
+- unchanged-worktree requirement;
+- no automatic retry;
+- no candidate #2;
+- no model switch;
+- RATE_LIMITED keeps compatibility UNPROVEN.
+
+9. REGISTRY
+
+Compatibility probe registry interaction remains:
+
+reads: NONE
+writes: NONE
+
+Historical Lightning/Gemma rollouts cannot create registry entries.
+
+After implementation and independent review, the first NEW manually authorized
+probe should be:
+
+nvidia/nemotron-3.5-lightning:free
+
+Only a NEW COMPATIBILITY_PROBE_SUCCESS may permit a later manual registry
+update.
+
+10. PRESERVE PROVIDER ARCHITECTURE
+
+Unchanged:
+- Codex remains the sole production agent;
+- OpenCode is development tooling only;
+- provider modes remain auto / primary / openrouter-free;
+- subscription-backed primary path unchanged;
+- preferred primary model remains gpt-5.6-sol;
+- existing safe subscription-plan allowlist unchanged;
+- agents.enabled=false remains OpenRouter-only;
+- multi_agent_v1 remains excluded there;
+- shell_command remains available;
+- strict verified-zero pricing remains mandatory;
+- exact specific :free identity remains mandatory;
+- immediate exact-model preflight remains mandatory;
+- normal fallback registry gate remains mandatory;
+- probe-only registry bypass remains narrow;
+- isolated CODEX_HOME remains mandatory;
+- auth.json isolation gate remains unchanged;
+- provenance semantics unchanged;
+- fresh-review semantics unchanged;
+- request_max_retries=0;
+- stream_max_retries=0;
+- no mid-run switching;
+- external inference spend requirement remains exactly $0.00.
+
+11. REQUIRED FUTURE HERMETIC TEST COVERAGE
+
+Require tests for at least:
+
+- normal SDK SUCCESS remains SUCCESS without recovery;
+- normal ExecutionResult + SDK false-negative + exact successful rollout
+  -> SUCCESS;
+- thrown terminal failure + success-looking rollout -> never SUCCESS;
+- structured 429 + success-looking rollout -> RATE_LIMITED;
+- missing current thread -> FAILED;
+- stale successful rollout -> FAILED;
+- newer unrelated successful rollout -> FAILED;
+- same model / different thread -> FAILED;
+- same worktree / different thread -> FAILED;
+- wrong provider -> FAILED;
+- wrong cwd -> FAILED;
+- wrong model -> FAILED;
+- missing model -> FAILED;
+- conflicting model metadata -> FAILED;
+- ambiguous same-file session metadata -> FAILED;
+- multiple exact-session rollout files -> FAILED;
+- symlink/junction escape -> FAILED;
+- path-prefix containment trap -> FAILED;
+- missing/corrupt/unreadable rollout -> FAILED;
+- no AGENTS.md shell_command -> FAILED;
+- AGENTS.md function_call without matching call_id output -> FAILED;
+- nonzero exit -> FAILED;
+- missing exit metadata -> FAILED;
+- malformed exit metadata -> FAILED;
+- fake "Process exited with code 0" appearing only in stdout -> FAILED;
+- assistant response only before tool -> FAILED;
+- empty post-tool assistant response -> FAILED;
+- post-tool response followed by task_complete.error -> NOT SUCCESS;
+- missing task_complete -> FAILED;
+- conflicting task_complete -> FAILED;
+- last_agent_message whitespace-only mismatch -> FAILED;
+- last_agent_message substring/fuzzy mismatch -> FAILED;
+- response_item/message vs event_msg/agent_message disagreement -> FAILED;
+- absent last_agent_message with otherwise proven final response -> eligible;
+- changed worktree -> FAILED;
+- rollout cannot bypass qualification/preflight/provider/worktree gates;
+- multiple AGENTS.md calls with at least one qualifying successful pair
+  -> eligible when every other predicate passes;
+- probe registry interaction remains NONE;
+- executor invocation count exactly 1;
+- no automatic retry;
+- no candidate #2;
+- no model switch;
+- no real OpenRouter/Codex inference/network request in hermetic tests.
+
+12. EXPECTED FUTURE BUILD SCOPE
+
+Prefer changes only to:
+
+tools/codex-controller/src/compatibility-probe.ts
+tools/codex-controller/test/compatibility-probe.test.ts
+
+Only if concretely required:
+
+tools/codex-controller/src/codex-executor.ts
+tools/codex-controller/src/core.ts
+tools/codex-controller/test/provider-flow.test.ts
+
+No selector redesign.
+No package changes.
+No new dependencies.
+
+13. FUTURE VERIFICATION
+
+Future BUILD must run:
+
+cd tools/codex-controller
+npm.cmd run build
+npm.cmd test
+
+The last verified runtime baseline is 111 tests.
+
+Run the complete suite twice.
+
+A static count of test(...) source occurrences is not a runtime test baseline
+and does not supersede the last verified 111-test result.
+
+If SDK lifecycle/provider-flow behavior changes or provider-flow.test.ts is
+touched, run the pinned SDK localhost loopback test independently between the
+two full-suite runs.
+
+Then run:
+
+git diff --check
+git diff --name-only
+git diff --stat
+git status --short
+
+No live compatibility probe during PLAN, BUILD, or REVIEW.
+
+### Compatibility-Probe SDK-Boundary Diagnostic Correction
+
+Status: APPROVED — implementation is authorized under this approved plan and remains diagnostic-only as defined below.
+
+Live evidence motivating this correction (diagnostic evidence only; no
+registry decision):
+
+- New manually authorized probe model:
+  `nvidia/nemotron-3.5-lightning:free`
+- Exact thread:
+  `01a01fc8-2151-7c83-a32f-563d55792898`
+- Actual compatibility command returned: `COMPATIBILITY_PROBE_FAILED`
+- Post-probe linked worktree remained unchanged.
+- Exactly one exact-thread rollout exists.
+- Persisted rollout proves:
+  - `provider=openrouter`;
+  - exact intended cwd/worktree;
+  - exact intended model;
+  - one `AGENTS.md` `shell_command`;
+  - exact matching `function_call_output`;
+  - canonical shell-result exit code `0`;
+  - non-empty post-tool assistant completion;
+  - exactly one `task_complete`;
+  - `task_complete.error` absent;
+  - no structured 429;
+  - exact `response_item`/`message` and `event_msg`/`agent_message` final
+    response equality;
+  - exact `task_complete.last_agent_message` equality.
+- Isolated `CODEX_HOME` scan found: no traversal errors; no reparse entries;
+  exactly one exact-thread rollout.
+- All 13 isolated rollout files passed the existing basic
+  corruption/session-metadata integrity checks.
+- The exact real Lightning rollout was replayed through the production
+  `runCompatibilityProbe()` using a fake executor that returned a normal
+  `ExecutionResult` with `threadId=<exact Lightning thread>`, `events=[]`, and
+  `finalResponse=""`; production recovery returned:
+  - `model_id=nvidia/nemotron-3.5-lightning:free`;
+  - `provider_id=openrouter`;
+  - `wire_api=responses`;
+  - `tool_loop_success=true`;
+  - `final_completion_success=true`;
+  - `worktree_unchanged=true`.
+
+Therefore the current production rollout-success parser/correlation accepts
+the actual live rollout when it is reached from the normal `ExecutionResult`
+path. The remaining unknown is the SDK-boundary behavior during the real live
+run: the live probe still returned `COMPATIBILITY_PROBE_FAILED`, so the
+failure evidence is presumed to originate at or before the
+`executor.execute(...)` boundary and never produced a normal
+`ExecutionResult`. This correction adds safe, bounded, internally/testably
+reportable diagnostic classification to identify which SDK-boundary condition
+actually occurred. It does NOT authorize thrown-error SUCCESS recovery.
+
+1. DIAGNOSTIC-ONLY SCOPE
+
+Add safe diagnostic classification only. This increment changes no
+compatibility outcome: `COMPATIBILITY_PROBE_SUCCESS`,
+`COMPATIBILITY_PROBE_RATE_LIMITED`, and `COMPATIBILITY_PROBE_FAILED`
+semantics are unchanged. The diagnostic report is additive and must never
+alter the existing public result, exit code, or safe report of a probe.
+
+2. UNCHANGED SEMANTICS
+
+- Do not change compatibility SUCCESS/RATE_LIMITED/FAILED semantics in this
+  increment.
+- Preserve the rule that thrown executor errors cannot become SUCCESS.
+- Preserve all existing structured-429 behavior exactly: structured
+  `http_status_code=429` only, no plain-text 429 classification, exact-thread
+  rollout correlation, isolated `CODEX_HOME`, provider/worktree/model exact
+  correlation, session uniqueness, filesystem containment,
+  unchanged-worktree requirement, no automatic retry, no candidate #2, no
+  model switch, and `RATE_LIMITED` leaves compatibility `UNPROVEN`.
+
+3. REQUIRED DIAGNOSTIC CLASSIFICATION
+
+Safely distinguish and report internally and testably, with fixed
+enums/booleans/counts only, at least:
+
+```text
+failure_before_executor: bool
+executor_threw_codex_error: bool
+executor_threw_non_codex_error: bool
+executor_http_status_present: bool
+executor_thread_id_present: bool
+executor_captured_event_count: int
+captured_structured_http_429: bool
+captured_turn_failed: bool
+captured_error: bool
+captured_item_error: bool
+executor_returned_normal_execution_result: bool
+normal_result_thread_id_present: bool
+normal_result_terminal_sdk_event_present: bool
+evaluate_probe_success: bool
+evaluate_probe_failed: bool
+rollout_recovery_attempted: bool
+rollout_success_evidence: bool
+rollout_correlation_failure_category: fixed enum
+worktree_equal: bool
+```
+
+Rules for classification:
+
+- `failure_before_executor` is true when the probe stopped before
+  `executor.execute(...)` was invoked (qualification, preflight, home,
+  environment, or configuration gate), matching the existing fail-closed
+  categories.
+- `executor_threw_codex_error` and `executor_threw_non_codex_error` are
+  mutually exclusive with each other and with
+  `executor_returned_normal_execution_result`; at most one is ever true.
+- `executor_http_status_present` records only whether structured `httpStatus`
+  metadata was available on the thrown error, never the value.
+- `executor_thread_id_present` records only whether an exact thread ID was
+  available on the thrown error or captured events, never the value.
+- `executor_captured_event_count` is the count of SDK events captured before
+  the terminal condition.
+- The four `captured_*` flags report only whether the captured SDK events
+  contain the listed structured condition; none of them is derived by parsing
+  message text.
+- `executor_returned_normal_execution_result` is true only when
+  `executor.execute(...)` returned normally with an `ExecutionResult`.
+- `normal_result_thread_id_present` and
+  `normal_result_terminal_sdk_event_present` record presence facts about that
+  normal result only.
+- `evaluate_probe_success` and `evaluate_probe_failed` record the outcome of
+  the existing SDK event evaluator before any rollout recovery is considered.
+- `rollout_recovery_attempted` records whether the existing
+  exact-current-thread rollout success recovery ran; `rollout_success_evidence`
+  records whether it produced success evidence.
+- `rollout_correlation_failure_category` is a fixed enum drawn from the
+  existing fail-closed correlation categories (for example wrong provider,
+  wrong cwd, wrong model, missing/conflicting/ambiguous session metadata,
+  multiple exact-session rollouts, symlink/junction escape, path containment,
+  missing/corrupt/unreadable rollout) or `none` when correlation succeeded.
+- `worktree_equal` is the existing pre/post `git status --short` equality fact.
+
+4. SAFE AND BOUNDED DIAGNOSTICS
+
+Diagnostics must be safe and bounded. Never output:
+
+- `OPENROUTER_API_KEY`;
+- any environment value;
+- prompts;
+- assistant/model text;
+- command stdout;
+- `AGENTS.md` contents;
+- full rollout contents;
+- authorization headers;
+- raw exception messages that may contain provider/request data.
+
+Prefer fixed enums/booleans/counts only. No diagnostic path may read, print,
+hash, or persist any of the forbidden values. Classification must come from
+already-collected typed metadata, never from message/body/stdout text parsing.
+
+5. DELIBERATE REPORT MECHANISM
+
+Existing normal CLI compatibility output must remain safe and unchanged in
+shape. Define the deliberate mechanism for obtaining the diagnostic report
+during a manually authorized compatibility probe as: on
+`COMPATIBILITY_PROBE_FAILED` only, append the fixed safe diagnostic
+`key=value` lines defined in section 3 to the probe's CLI output, each value a
+fixed enum, boolean, or count. `COMPATIBILITY_PROBE_SUCCESS` and
+`COMPATIBILITY_PROBE_RATE_LIMITED` output remains exactly as currently
+specified and gains no diagnostic lines in this increment. Do not create a
+generic debug mode and do not add a debug flag that dumps arbitrary state. An
+explicit diagnostic flag/mode may be used only if the on-failure fixed-lines
+mechanism is materially unsafe; the expected answer is the fixed-lines
+mechanism.
+
+6. REGISTRY ISOLATION
+
+Diagnostics must not read or write the compatibility registry. Probe registry
+interaction remains reads: NONE, writes: NONE.
+
+7. NO REDESIGN
+
+No catalog/selector redesign. No retry. No candidate #2. No model switching.
+
+8. DEPENDENCIES
+
+No new dependencies unless absolutely unavoidable; the expected answer is no
+new dependencies.
+
+9. EXPECTED FUTURE IMPLEMENTATION SCOPE
+
+Prefer changes only to:
+
+```text
+tools/codex-controller/src/compatibility-probe.ts
+tools/codex-controller/test/compatibility-probe.test.ts
+```
+
+Include the following only if the diagnostic contract concretely requires
+them:
+
+```text
+tools/codex-controller/src/codex-executor.ts
+tools/codex-controller/src/index.ts
+tools/codex-controller/test/provider-flow.test.ts
+```
+
+No selector package, package.json, lockfile, or other repository file is
+authorized to change.
+
+10. REQUIRED HERMETIC TEST COVERAGE
+
+Require hermetic tests proving diagnostic classification for all major
+branches without real inference or network:
+
+- failure before executor invocation reports `failure_before_executor=true`;
+- thrown `CodexExecutionError` reports `executor_threw_codex_error=true` and
+  never SUCCESS;
+- thrown non-Codex error, when reachable, reports
+  `executor_threw_non_codex_error=true` and never SUCCESS;
+- thrown error with structured `httpStatus` reports present; without it
+  reports absent;
+- thrown path with exact thread ID reports present; without it absent;
+- captured event count matches the injected event list;
+- captured events containing structured HTTP 429, `turn.failed`, stream
+  `error`, and item `error` each set their flag independently;
+- normal `ExecutionResult` reports
+  `executor_returned_normal_execution_result=true`;
+- normal result with and without thread ID reports presence;
+- normal result with and without terminal SDK event reports presence;
+- SDK evaluator SUCCESS and FAILED outcomes are recorded before recovery;
+- rollout recovery attempted/not attempted and success evidence true/false are
+  recorded;
+- each rollout correlation failure category is recorded as its fixed enum;
+- `worktree_equal` true and false are recorded;
+- fixed diagnostic CLI lines appear on `COMPATIBILITY_PROBE_FAILED` only;
+- success and rate-limited CLI output contains no diagnostic lines;
+- no forbidden value (key, environment, prompt, model text, stdout, AGENTS.md
+  contents, full rollout, headers, raw exception message) appears in any
+  diagnostic output;
+- registry interaction remains reads: NONE, writes: NONE;
+- executor invocation count remains exactly one;
+- no automatic retry, no candidate #2, no model switch;
+- no real OpenRouter/Codex inference or network request occurs in tests.
+
+11. PROVIDER ARCHITECTURE AND COST PRESERVED
+
+Preserve the current provider architecture and the exact `$0.00` external
+inference spend requirement. No change to provider modes, primary path,
+preferred primary model, selector rules, registry gate, isolated `CODEX_HOME`,
+`agents.enabled=false`, zero retries, or no-mid-run-switching contracts.
+
+12. FUTURE PROBE AUTHORIZATION
+
+After this correction is implemented and independently reviewed, the user will
+authorize exactly ONE new Lightning compatibility probe for
+`nvidia/nemotron-3.5-lightning:free`. That future probe is diagnostic evidence
+only unless the existing compatibility logic itself returns
+`COMPATIBILITY_PROBE_SUCCESS`. If it still returns
+`COMPATIBILITY_PROBE_FAILED`, do not register the model and do not retry.
+
+13. THROWN-ERROR SUCCESS DECISION DEFERRED
+
+Any decision about allowing SUCCESS from a thrown `CodexExecutionError` is
+explicitly deferred until the diagnostic probe proves which SDK-boundary
+condition actually occurred. This correction does not authorize that decision.
+
+### Recoverable SDK Item-Error Rollout Correction
+
+Status:
+
+APPROVED — implementation is authorized under this approved plan and remains limited to the item-error rollout correction defined below.
+
+PURPOSE
+
+Correct one specific false-negative discovered by the manually authorized
+Lightning diagnostic probe.
+
+LIVE EVIDENCE
+
+Model:
+
+nvidia/nemotron-3.5-lightning:free
+
+The diagnostic probe returned:
+
+COMPATIBILITY_PROBE_FAILED
+
+with:
+
+failure_before_executor=false
+executor_threw_codex_error=false
+executor_threw_non_codex_error=false
+executor_http_status_present=false
+executor_thread_id_present=false
+executor_captured_event_count=13
+captured_structured_http_429=false
+captured_turn_failed=false
+captured_error=false
+captured_item_error=true
+executor_returned_normal_execution_result=true
+normal_result_thread_id_present=true
+normal_result_terminal_sdk_event_present=true
+evaluate_probe_success=false
+evaluate_probe_failed=true
+rollout_recovery_attempted=false
+rollout_success_evidence=false
+rollout_correlation_failure_category=none
+worktree_equal=true
+
+The linked worktree remained unchanged.
+
+The exact persisted rollout from that same probe independently proved:
+
+- no response_item/error;
+- no event_msg/error;
+- no task_failed;
+- exactly one task_complete;
+- task_complete.error absent;
+- successful required AGENTS.md shell_command;
+- exact matching function_call_output;
+- canonical shell-result exit code 0;
+- non-empty assistant completion after the successful tool result.
+
+The rollout contained two shell_command calls.
+
+Call 1:
+- targets AGENTS.md;
+- matching output present;
+- canonical shell envelope present;
+- canonical exit code 0.
+
+Call 2:
+- does not target AGENTS.md;
+- matching output present;
+- output is a string;
+- output is NOT a canonical successful shell-result envelope.
+
+There is no persisted terminal failure corresponding to the second call.
+Its existence is consistent with the SDK item_error being an intermediate
+recoverable item failure, but the plan must NOT depend on guessing or parsing
+the second output's text.
+
+The existing approved rollout-success evidence already accepts the exact live
+rollout when reached from a normal ExecutionResult false-negative path.
+
+PROBLEM
+
+Current normal-result recovery blocks rollout inspection whenever:
+
+result.events
+
+contains an item whose type is "error".
+
+The live evidence proves that SDK item_error is not necessarily terminal:
+the exact persisted session can recover and finish successfully afterward.
+
+CORRECTION
+
+Change ONLY the normal-ExecutionResult rollout-recovery blocker semantics.
+
+An SDK item_error alone must no longer automatically block exact-current-thread
+rollout-success recovery.
+
+The item_error itself is NEVER success evidence.
+
+It merely permits evaluation of the existing stronger persisted rollout
+evidence when all other required gates permit recovery.
+
+RECOVERY MAY BE ATTEMPTED ONLY WHEN ALL OF THESE HOLD
+
+1. executor.execute() returned normally with ExecutionResult.
+
+2. SDK evaluateProbe did not already succeed.
+
+3. Worktree before/after strings are exactly equal.
+
+4. Exact result.threadId is present.
+
+5. Prepared isolated fallback CODEX_HOME is present.
+
+6. No structured HTTP 429 exists in the SDK event stream.
+
+7. No turn.failed exists.
+
+8. No top-level SDK error event exists.
+
+9. An SDK item_error may be present.
+
+10. Recovery uses ONLY the exact current result.threadId.
+
+11. Existing hardened rollout correlation remains unchanged:
+    - isolated CODEX_HOME;
+    - provider=openrouter;
+    - exact cwd;
+    - exact intended model;
+    - exact session/thread;
+    - exactly one matching session;
+    - containment;
+    - symlink/reparse rejection;
+    - corrupt/unreadable/ambiguous fail closed.
+
+12. Existing rolloutSuccessEvidence() must independently return true.
+
+13. Persisted terminal failures remain hard blockers exactly as already defined.
+
+14. Existing task_complete requirements remain unchanged.
+
+15. Existing AGENTS.md function_call/function_call_output/canonical exit-0
+    requirements remain unchanged.
+
+16. Existing final assistant response agreement requirements remain unchanged.
+
+17. Existing last_agent_message requirements remain unchanged.
+
+18. Worktree equality remains mandatory and cannot be recovered from rollout.
+
+19. Registry reads/writes remain NONE.
+
+HARD BLOCKERS THAT MUST REMAIN HARD BLOCKERS
+
+- executor throws for any reason;
+- CodexExecutionError throw;
+- structured HTTP 429;
+- turn.failed;
+- top-level SDK error;
+- changed worktree;
+- missing result.threadId;
+- missing prepared CODEX_HOME;
+- rollout correlation failure;
+- missing/corrupt/unreadable/ambiguous rollout;
+- persisted task_failed;
+- persisted response_item/error;
+- persisted event_msg/error if existing success parser treats it as terminal;
+- task_complete.error present;
+- unsuccessful/missing AGENTS.md tool evidence;
+- missing final assistant completion.
+
+Do NOT broaden this correction to thrown-executor recovery.
+
+Do NOT authorize success from a thrown CodexExecutionError.
+
+Do NOT ignore structured 429.
+
+Do NOT treat item_error itself as success.
+
+Do NOT parse item_error text.
+
+Do NOT parse the second tool output text.
+
+Do NOT add heuristics based on error strings.
+
+429 SEMANTICS
+
+Preserve existing structured-429 behavior exactly.
+
+RATE_LIMITED behavior must remain unchanged.
+
+DIAGNOSTICS
+
+Preserve the approved SDK-boundary diagnostic increment.
+
+For the newly recoverable normal-result path:
+
+- captured_item_error may remain true;
+- normal_result_terminal_sdk_event_present should be revised only if necessary
+  so its meaning remains truthful and documented;
+- rollout_recovery_attempted should become true when the recovery is actually
+  attempted;
+- rollout_success_evidence should reflect the actual persisted evidence;
+- correlation category remains fixed/bounded;
+- SUCCESS CLI output remains unchanged and gains no diagnostic lines.
+
+If diagnostic field semantics need clarification because item_error is no longer
+considered a hard terminal blocker for recovery, define that explicitly in the
+plan instead of silently changing field meaning.
+
+EXPECTED IMPLEMENTATION SCOPE
+
+Prefer only:
+
+tools/codex-controller/src/compatibility-probe.ts
+tools/codex-controller/test/compatibility-probe.test.ts
+
+Modify index.ts/provider-flow.test.ts only if concretely necessary.
+
+No dependency changes.
+No selector changes.
+No registry changes.
+No package/lock changes.
+
+TEST REQUIREMENTS
+
+Require hermetic tests proving at least:
+
+1. normal result + item_error + exact successful persisted rollout => SUCCESS;
+
+2. item_error itself without qualifying persisted rollout => FAILED;
+
+3. item_error + changed worktree => FAILED;
+
+4. item_error + missing thread ID => FAILED;
+
+5. item_error + rollout correlation failure => FAILED;
+
+6. item_error + persisted terminal failure => FAILED;
+
+7. item_error + task_complete.error => FAILED;
+
+8. item_error + missing successful AGENTS.md evidence => FAILED;
+
+9. item_error + structured 429 => RATE_LIMITED, never SUCCESS;
+
+10. item_error + turn.failed => FAILED;
+
+11. item_error + top-level SDK error => FAILED;
+
+12. thrown CodexExecutionError + successful-looking rollout => FAILED;
+
+13. existing normal no-error SDK SUCCESS remains SUCCESS;
+
+14. existing normal rollout false-negative recovery remains SUCCESS;
+
+15. RATE_LIMITED semantics unchanged;
+
+16. SUCCESS output unchanged;
+
+17. diagnostic FAILED output remains safe;
+
+18. no retry;
+
+19. exactly one executor invocation;
+
+20. registry interaction NONE;
+
+21. no real inference/network.
+
+LIVE GATE
+
+No live compatibility probe during PLAN, BUILD, or REVIEW.
+
+After:
+- approved PLAN;
+- BUILD PASS;
+- independent REVIEW PASS;
+- supervisor authorization;
+
+authorize exactly ONE new:
+
+nvidia/nemotron-3.5-lightning:free
+
+compatibility probe.
+
+No retry.
+
+If it returns SUCCESS:
+- stop;
+- do not automatically register until supervisor evaluates the result.
+
+If it returns FAILED or RATE_LIMITED:
+- stop;
+- no registration;
+- no retry.
+
+COST / ARCHITECTURE
+
+Preserve exactly $0.00 external inference spend.
+Preserve existing provider architecture.
+Production agent remains Codex-only.
+OpenCode remains development-time only.
+
+VERIFICATION REQUIREMENTS FOR FUTURE BUILD
+
+From tools/codex-controller:
+
+npm.cmd run build
+
+npm.cmd test
+
+Full suite twice.
+
+Pinned SDK localhost loopback only if SDK lifecycle/provider-flow/index behavior
+is touched.
+
+From repository root:
+
+git diff --check
+git diff --name-only
+git diff --stat
+git status --short
+
+No live probe during BUILD/REVIEW.
+
 ### Probe Success and Safe Report
 
 All of these are mandatory:

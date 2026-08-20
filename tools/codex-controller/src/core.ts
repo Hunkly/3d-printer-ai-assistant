@@ -8,7 +8,7 @@ export function parsePhase(v:string|undefined):CodexPhase{const n=v?.trim().toLo
 export function parseReviewTarget(v:string|undefined):ReviewTarget|undefined{if(v===undefined||!v.trim())return undefined;const n=v.trim().toLowerCase();if(n!=="plan"&&n!=="implementation")throw new Error("INVALID_REVIEW_TARGET");return n;}
 const FALLBACK_ALLOW=["PATH","PATHEXT","SYSTEMROOT","WINDIR","COMSPEC","TEMP","TMP","USERPROFILE","APPDATA","LOCALAPPDATA","PROGRAMDATA","PROGRAMFILES","PROGRAMFILES(X86)","PROCESSOR_ARCHITECTURE","NUMBER_OF_PROCESSORS","TERM","COLORTERM","NO_COLOR","OPENROUTER_API_KEY"];
 export function primaryEnvironment(env:NodeJS.ProcessEnv):Record<string,string>{const out:Record<string,string>={};for(const [key,value] of Object.entries(env))if(value!==undefined&&key.toLowerCase()!=="openrouter_api_key"&&FALLBACK_ALLOW.some(x=>x.toLowerCase()===key.toLowerCase()))out[key]=value;return out;}
-export interface FallbackFilesystem {mkdir(path:string,options:{recursive:true}):void;lstat(path:string):{isDirectory():boolean;isSymbolicLink():boolean};exists(path:string):boolean;}
+export interface FallbackFilesystem {mkdir(path:string,options:{recursive:true}):void;lstat(path:string):{isDirectory():boolean;isSymbolicLink():boolean};exists(path:string):boolean;readdir?(path:string):string[];readFile?(path:string):string;}
 const defaultFallbackFilesystem:FallbackFilesystem={mkdir:(path,options)=>mkdirSync(path,options),lstat:path=>lstatSync(path),exists:path=>existsSync(path)};
 export interface FallbackIsolation {filesystem?:FallbackFilesystem;localAppData?:string;}
 export interface PreparedFallback {environment:Record<string,string>;home:string;}

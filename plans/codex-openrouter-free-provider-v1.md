@@ -242,9 +242,10 @@ post-sanitization `CODEX_HOME` injection, so both paths have identical
 provider/auth isolation behavior.
 
 The probe remains model-specific and does not establish compatibility for
-`z-ai/glm-5.2:free`; that model's failed probe remains failed evidence until a
-new explicitly authorized probe is performed after this correction is built and
-reviewed. No special probe-only home is allowed.
+`z-ai/glm-5.2:free`; its partial execution and terminal rate-limit outcome
+remain inconclusive `UNPROVEN` evidence until a new explicitly authorized probe
+is performed after this correction is built and reviewed. No special probe-only
+home is allowed.
 
 Preserve the existing thread identity rule of provider, exact model, role, and
 worktree. The stable isolated home exists so fallback thread/session state can
@@ -753,53 +754,93 @@ No environment variable, task file, CLI argument, user prompt, or normal phase p
 
 ### Pinned SDK Event Evidence
 
-The public 0.147.0 SDK `ThreadEvent` contract proves the local repository interaction through an `ItemCompletedEvent` with `event.type === "item.completed"` and `event.item.type === "command_execution"`. Success additionally requires `event.item.status === "completed"`, `event.item.exit_code === 0`, and a non-empty `event.item.command` that targets the exact `AGENTS.md` token requested by the controller prompt. `item.started`, `item.updated`, final text alone, `mcp_tool_call`, `web_search`, or an item with missing/nonzero exit code does not qualify. `thread.started` proves the fresh thread began; `turn.completed` plus a non-empty final Codex response proves final completion. Any `turn.failed`, stream `error`, failed command item, provider/protocol error, or absent required event fails.
+The public 0.147.0 SDK `ThreadEvent` contract proves the local repository interaction through an `ItemCompletedEvent` with `event.type === "item.completed"` and `event.item.type === "command_execution"`. Success additionally requires `event.item.status === "completed"`, `event.item.exit_code === 0`, and a non-empty `event.item.command` that targets the exact `AGENTS.md` token requested by the controller prompt. `item.started`, `item.updated`, final text alone, `mcp_tool_call`, `web_search`, or an item with missing/nonzero exit code does not qualify. `thread.started` proves the fresh thread began; `turn.completed` plus a non-empty final Codex response proves final completion. Any `turn.failed`, stream `error`, failed command item, provider/protocol error, or absent required event makes the turn unsuccessful, while events observed before that failure remain available for partial diagnostics under the terminal-error contract below.
 
 This event contract is observable in the installed public SDK, so the plan remains buildable. If Build discovers the runtime declaration or emitted contract differs, Build must stop as a plan/repository contradiction and must not infer tool success from text.
 
 ### Compatibility-Probe Rate-Limit Classification Correction
 
-The latest valid real probe for `z-ai/glm-5.2:free` used `provider=openrouter`,
-the isolated `CODEX_HOME` at
-`%LOCALAPPDATA%\\print-engineer-codex\\openrouter-home-v1`,
-`agents.enabled=false`, and the production OpenRouter configuration. It reached
-the real provider and produced trustworthy structured failure evidence with
-`http_status_code=429`; the corresponding Codex classification was
-`response_too_many_failed_attempts`. The separate OpenRouter key metadata
-check returned HTTP 200 with `is_free_tier=true` and zero usage fields. This
-proves authentication and provider reachability, but does not prove or disprove
-model compatibility. The model remains `UNPROVEN`.
+The valid real compatibility probe for `z-ai/glm-5.2:free` used
+`provider=openrouter`, `agents.enabled=false`, an isolated controller-owned
+`CODEX_HOME`, a clean linked worktree, and a fresh Codex thread:
+`01a01ee2-48ea-7a41-aacc-574f51f872b2`. OpenRouter activity proved an initial
+HTTP 200 Responses request for `z-ai/glm-5.2:free` through provider `Decart`,
+with 9619 input tokens, 61 output tokens, streaming enabled, finish reason
+`tool_calls`, and `$0.00` cost. The next upstream request returned HTTP 429.
 
-Add the distinct result `COMPATIBILITY_PROBE_RATE_LIMITED`. It means the
-compatibility result is inconclusive, is not probe success, and is never a
-compatibility-registry success. The result may be emitted only when structured
-Codex/SDK event error metadata, preferably
-`codex_error_info.response_too_many_failed_attempts.http_status_code`, proves
-HTTP status exactly `429` (or an equivalent structured SDK representation of
-that same status). Do not inspect prompts, ordinary model output, or arbitrary
-error text for this classification. Unknown, unstructured, malformed, transport,
-schema, command, completion, worktree, provider, model, and every non-429 HTTP
-failure, including 400, 401, 402, 403, and representative 5xx failures, remain
-`COMPATIBILITY_PROBE_FAILED`.
+The exact rollout proved `thread.started`, a `shell_command` function call
+targeting `Get-Content .\\AGENTS.md -TotalCount 20`, a matching
+`function_call_output`, and command exit code zero. It did not prove a final
+post-tool model completion. Therefore initial Responses generation, streaming,
+the valid shell command, AGENTS.md targeting, command success, matching tool
+output, and zero cost are proven; final completion and full compatibility are
+not proven. The latest terminal outcome is HTTP 429 rate limited/inconclusive;
+the model and registry eligibility remain `UNPROVEN`.
 
-`COMPATIBILITY_PROBE_RATE_LIMITED` is reported with a non-zero CLI exit code,
-using the existing probe-failure mechanism unless the implementation requires
-a distinct code. The stable machine-readable token must be emitted explicitly;
-the same classified 429 must not also be reported as
-`COMPATIBILITY_PROBE_FAILED`. Safe optional fields may include
-`provider=openrouter`, the exact public model, `http_status=429`, and
-`compatibility=unproven`. Secrets, headers, prompts, full response bodies, and
-unrelated rollout contents remain excluded.
+The pinned Codex SDK 0.147.0 public `ThreadEvent`/thrown-error boundary exposes
+message-only failure information on this path. The richer persisted rollout
+structure
+`codex_error_info.response_too_many_failed_attempts.http_status_code` is not
+reliably surfaced there. Do not assume the thrown JavaScript error contains
+`codex_error_info`, and do not compensate by parsing ordinary error messages
+such as `429 Too Many Requests`. Plain-text classification is forbidden.
 
-A rate-limited result leaves the model `UNPROVEN`, writes no registry entry or
-validity window, does not update prior compatibility success, and does not make
-the model eligible for ordinary fallback. It triggers no automatic retry,
-delay, loop, candidate-two attempt, fallback, or model switch. The existing
-`request_max_retries=0` and `stream_max_retries=0` remain unchanged, and the
-executor invocation count is exactly one. A future retry is a new explicit
-manual probe that repeats every current catalog, pricing, preflight, registry,
-isolated-home, auth, worktree, fresh-thread, and production-configuration gate.
-No PLAN/BUILD/REVIEW provenance is created or changed.
+The executor contract must preserve both already-observed legitimate streamed
+events and safely available structured terminal failure metadata when the SDK
+stream later throws. A terminal failure is never an `ExecutionResult` success;
+the typed internal result must be able to express `partial_events` plus
+`terminal_error`, including the exact thread ID from `thread.started` when it
+was observed. The controller may use preserved partial events for safe
+diagnostics such as `thread_started=true`,
+`AGENTS_md_command_completed=true`, `command_exit_code=0`,
+`tool_output_produced=true`, and `final_completion=false`, but partial tool-loop
+evidence can never satisfy probe success. Full success still requires every
+existing success condition, including final successful completion.
+
+Add the distinct result `COMPATIBILITY_PROBE_RATE_LIMITED`. It may be emitted
+only when the current failed execution has a trustworthy exact thread ID and
+the minimum structured terminal metadata from the exact correlated persisted
+rollout proves:
+
+```text
+event_msg.payload.type = task_complete
+event_msg.payload.error.codex_error_info.response_too_many_failed_attempts.http_status_code = 429
+```
+
+An equivalent exact structured representation is acceptable. The fallback must
+inspect only the validated isolated OpenRouter `CODEX_HOME` at
+`%LOCALAPPDATA%\\print-engineer-codex\\openrouter-home-v1`, never the normal
+ChatGPT-authenticated home. It must use the exact current thread/session ID
+obtained from this execution, including the ID preserved from `thread.started`;
+it must never select the newest/latest/arbitrary rollout or discover a session
+by model/worktree alone. If session metadata exists, `payload.id` or
+`payload.session_id` must equal the current thread ID exactly; filename matching
+alone is insufficient.
+
+Before trusting rollout evidence, require the rollout to be under the already
+validated isolated home and correlate exact session ID, `model_provider=openrouter`,
+the exact current linked-worktree cwd, intended exact model context when
+available, and terminal evidence belonging to that session. If any correlation
+is missing, conflicting, corrupt, unreadable, or otherwise unproven, fail closed
+as `COMPATIBILITY_PROBE_FAILED`. Inspect only the minimum structured terminal
+metadata needed for classification. Never log or expose prompts, AGENTS.md
+contents, function arguments except safe probe evidence already permitted,
+command output, keys, authorization headers, unrelated response contents, or
+complete rollout JSON.
+
+Rollout inspection is only a terminal-failure classification fallback. It is
+never an independent success engine and cannot declare
+`COMPATIBILITY_PROBE_SUCCESS`; normal execution/probe evidence must still prove
+final completion. A partial successful tool loop followed by a terminal 429 is
+therefore `COMPATIBILITY_PROBE_RATE_LIMITED`, not success. A structured exact
+thread 429 leaves compatibility `UNPROVEN`, performs no registry interaction,
+does not create validity evidence, performs no automatic retry, never selects
+candidate two, never switches models, and has executor invocation count one.
+The result is reported with a non-zero CLI exit code. All non-429, missing,
+unstructured, malformed, stale, concurrent, wrong-provider, wrong-worktree,
+wrong-model, or otherwise uncorrelated evidence remains
+`COMPATIBILITY_PROBE_FAILED`; text containing `429` without structured status
+must fail rather than become rate limited.
 
 ### Probe Success and Safe Report
 
@@ -1075,13 +1116,38 @@ the compatibility-registry gate; and `z-ai/glm-5.2:free` is not added to the
 registry. Do not create an unrelated temporary registry file merely to assert
 that it remains unchanged. No test performs a real OpenRouter call.
 
+Extend those hermetic tests to require: useful SDK events followed by terminal
+failure preserve partial events and terminal-error metadata without producing a
+successful `ExecutionResult`; preserved AGENTS.md command completion with exit
+code zero and tool output but no final completion is not probe success; an
+exact current-thread rollout with structured 429 is rate limited; an exact
+current-thread rollout with non-429 is failed; a stale different-thread 429, a
+newer unrelated 429, a same-model different-thread 429, and a same-worktree
+different-thread 429 are ignored and fail closed; newest-rollout selection is
+never used; exact thread ID with wrong provider or worktree correlation fails;
+missing, corrupt, or unreadable rollout fails; rollout message text containing
+`429` without structured status fails; and no prompt, command output, AGENTS.md
+contents, secret, header, unrelated response, or complete rollout JSON leaks
+through production diagnostics. Prove that normal successful compatibility
+behavior is unchanged, no real OpenRouter call occurs, no automatic retry or
+model switch occurs, registry interaction remains `NONE`, and executor
+invocation count remains one. All rollout fixtures must be hermetic and bound
+to the exact current thread; no repository-global or worktree-global session
+discovery is permitted.
+
 All use injected catalog/preflight, clock, Git, filesystem, and Codex stream fakes. There is no real network, Codex, inference, printer, or hardware access.
 
 Mandatory Build verification is package-focused: build/test `tools/openrouter-free-selector`, then build/test `tools/codex-controller`. TypeScript/Markdown scope makes Ruff/Mypy inapplicable. Do not run broad repository suites.
 
 ## Optional Live Compatibility Probe
 
-Only after Build and independent implementation review, the user may explicitly set the required environment and run `npm start -- --compatibility-probe` once with one currently verified-free exact model. This is optional/manual, never CI. A successful safe report may be used by the user to manually create/update the registry entry; it never self-registers.
+No real compatibility probe is performed during this plan correction, approval
+review, Build, or implementation review. Only after Build and independent
+implementation review, as a separate explicit decision, may the user set the
+required environment and run `npm start -- --compatibility-probe` once with one
+currently verified-free exact model. This is optional/manual, never CI. A
+successful safe report may be used by the user to manually create/update the
+registry entry; it never self-registers.
 
 ## Exact Build Scope
 

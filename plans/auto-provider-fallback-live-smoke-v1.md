@@ -238,7 +238,7 @@ PLAN / BUILD / REVIEW role semantics remain unchanged.
   `request|image|web_search|internal_reasoning|input_cache_read|input_cache_write`
   zero-or-absent; `overrides` absent or exactly `[]`; no unknown keys), text
   input/output, native `tools`, `context_length` and `top_provider.context_length`
-  >= 32768, `expiration_date` absent or in the future. Failure → 
+  >= 32768, `expiration_date` absent or in the future. Failure →
   `OPENROUTER_REQUEST_FAILED`/`OPENROUTER_PREFLIGHT_FAILED`, stops before Codex.
 
 ### 5.6 Exact provenance output/location

@@ -10,7 +10,7 @@
     "prebuild": "npm --prefix ../openrouter-free-selector run build",
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
-    "test": "node --test dist/test/core.test.js dist/test/codex-app-server-client.test.js dist/test/provider-decision.test.js dist/test/provider-flow.test.js dist/test/compatibility-probe.test.js",
+    "test": "node --test dist/test/core.test.js dist/test/codex-app-server-client.test.js dist/test/provider-decision.test.js dist/test/provider-flow.test.js dist/test/compatibility-probe.test.js dist/smoke/smoke-control.test.js dist/smoke/smoke-harness.test.js",
     "start": "node dist/src/index.js"
   },
   "dependencies": {

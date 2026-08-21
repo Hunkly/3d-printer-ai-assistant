@@ -1,0 +1,10 @@
+Read AGENTS.md at the root of the named worktree and report:
+1. The exact document title (first heading text).
+2. The first execution-contract priority item listed under the source-of-truth section.
+3. Whether the document declares any printer-safety or hardware-related constraints, and the first such constraint if present.
+
+Constraints:
+- Read-only inspection only. Do not modify any file in the worktree.
+- Do not run package installation, network calls, hardware/MQTT, or Git publication.
+- Do not commit, push, or open any pull request.
+- Keep the report under 200 words and cite the line numbers you read.

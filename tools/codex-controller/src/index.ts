@@ -116,6 +116,34 @@ function run(command: string, args: string[], cwd?: string): string {
 function git(repo: string, ...args: string[]): string {
   return run("git", ["-C", repo, ...args]);
 }
+
+function captureGitStatus(worktree: string): string {
+  return git(worktree, "status", "--short");
+}
+
+async function writeReadOnlyExecutionRecord(
+  taskKey: string,
+  worktree: string,
+  modelId: string,
+  worktreeStateHash: string
+): Promise<void> {
+  const { atomicWrite, readonlyExecutionPaths } = await import("@print-engineer/openrouter-free-selector");
+  const paths = readonlyExecutionPaths(worktree, taskKey, worktree);
+  const record = {
+    schema_version: 1,
+    kind: "readonly_execution",
+    task_key: taskKey,
+    worktree_path: worktree,
+    worktree_state_sha256: worktreeStateHash,
+    provider_id: "openrouter" as const,
+    model_id: modelId,
+    phase: "general" as const,
+    role: "readonly" as const,
+    completed_at: new Date().toISOString(),
+    success: true as const,
+  };
+  await atomicWrite(paths.record, record);
+}
 function validateExistingLinkedWorktree(worktree:string,env:NodeJS.ProcessEnv=process.env){if(!existsSync(worktree))throw new Error("INVALID_WORKTREE");const top=resolve(git(worktree,"rev-parse","--show-toplevel")),gitDir=resolve(git(worktree,"rev-parse","--path-format=absolute","--git-dir")),common=resolve(git(worktree,"rev-parse","--path-format=absolute","--git-common-dir"));if(top!==resolve(worktree)||gitDir===common)throw new Error("INVALID_WORKTREE");const repo=resolve(env.CODEX_REPO??"../..");if(resolve(git(repo,"rev-parse","--path-format=absolute","--git-common-dir"))!==common)throw new Error("INVALID_WORKTREE");for(const secret of [".env",".env.local","config/config.local.yaml"])if(existsSync(resolve(worktree,...secret.split("/"))))throw new Error("SECRET_FILE_PRESENT");return worktree;}
 function fallbackTask(worktree:string,env:NodeJS.ProcessEnv=process.env){const value=env.MODEL_TASK_FILE;if(!value?.trim())throw new Error("INVALID_TASK_FILE");const path=resolve(worktree,value);const bytes=readFileSync(path);if(!bytes.length||bytes.length>262144||bytes.subarray(0,3).equals(Buffer.from([239,187,191])))throw new Error("INVALID_TASK_FILE");const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);if(!text.trim())throw new Error("INVALID_TASK_FILE");return text;}
 
@@ -374,7 +402,8 @@ export async function runCodexTask(
   providerMode: "primary"|"openrouter-free",
   modelIdentity: string,
   executor?: CodexExecutor,
-  isolation: FallbackIsolation = {}
+  isolation: FallbackIsolation = {},
+  gitStatus?: (worktree: string) => string
 ): Promise<string> {
   const existing = state.threads[taskKey];
   const shouldResume = threadMode === "resume" && phase !== "review" && existing !== undefined && existing.schemaVersion===2 && existing.providerMode===providerMode && existing.modelIdentity===modelIdentity && existing.role===phase && existing.worktree===workingDirectory;
@@ -387,7 +416,27 @@ export async function runCodexTask(
   console.log("[controller] starting Codex stream...");
   let finalResponse = "";
   const execute=async()=>{if(providerMode === "primary"){const codex = new Codex({env:primaryEnvironment(process.env)});thread = shouldResume ? codex.resumeThread(existing!.threadId, { workingDirectory, model:modelIdentity }) : codex.startThread({ workingDirectory, model:modelIdentity });const {events}=await thread.runStreamed(prompt);for await(const event of events){const response=printEvent(event);if(response!==null)finalResponse=response;}}else{const result=await runNormalFallbackExecution(phase,executor??new SdkCodexExecutor(),modelIdentity,workingDirectory,prompt,process.env,shouldResume?existing!.threadId:undefined,isolation);thread={id:result.threadId};for(const event of result.events){const response=printEvent(event);if(response!==null)finalResponse=response;}}};
+
+  // Read-only worktree guard for general phase with openrouter-free
+  const isReadOnlyFallback = providerMode === "openrouter-free" && phase === "general";
+  const statusFn = gitStatus ?? captureGitStatus;
+  let beforeStatus = "";
+  if (isReadOnlyFallback) {
+    beforeStatus = statusFn(workingDirectory);
+  }
+
   if(providerMode==="openrouter-free"&&(phase==="plan"||phase==="build")){const {computeWorktreeStateHash,provenancePaths}=await import("@print-engineer/openrouter-free-selector");const planPath=process.env.MODEL_PLAN_PATH;if(!planPath)throw new Error("INVALID_PLAN_PATH");const canonical=planPath.replaceAll("\\","/");const paths=provenancePaths(workingDirectory,canonical);const ops=await defaultProvenanceOps(workingDirectory,canonical,paths,execute,()=>computeWorktreeStateHash(workingDirectory));if(phase==="plan")await runPlanProducer(modelIdentity,ops);else await runBuildProducer(modelIdentity,ops);}else await execute();
+
+  if (isReadOnlyFallback) {
+    const afterStatus = statusFn(workingDirectory);
+    if (beforeStatus !== afterStatus) {
+      throw new Error("READONLY_WORKTREE_MUTATED");
+    }
+    // Write readonly execution provenance record
+    const { computeWorktreeStateHash } = await import("@print-engineer/openrouter-free-selector");
+    const worktreeStateHash = computeWorktreeStateHash(workingDirectory);
+    await writeReadOnlyExecutionRecord(taskKey, workingDirectory, modelIdentity, worktreeStateHash);
+  }
 
   const shouldPersist = !shouldResume && !(phase === "review" && threadMode === "fresh");
   if (shouldPersist) {
@@ -411,7 +460,7 @@ export async function runCodexTask(
   return finalResponse;
 }
 
-async function runGitHubIssueMode(repo: string, issueNumber: number, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode, providerMode:"primary"|"openrouter-free",modelIdentity?:string): Promise<void> {
+async function runGitHubIssueMode(repo: string, issueNumber: number, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode, providerMode:"primary"|"openrouter-free",modelIdentity?:string,executor?:CodexExecutor,isolation:FallbackIsolation={},fetcher:typeof fetch=fetch,registryPath?:string): Promise<void> {
   assertGitHubCli(repo);
   const repository = process.env.CODEX_GITHUB_REPO ?? getRepositoryName(repo);
   const issue = readIssue(repo, repository, issueNumber);
@@ -422,10 +471,10 @@ async function runGitHubIssueMode(repo: string, issueNumber: number, base: strin
   const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
   if(providerMode==="openrouter-free")validateExistingLinkedWorktree(worktree);
   const baselineUntracked = listUntracked(worktree);
-  modelIdentity ??= (await fallbackSelection(worktree,phase)).modelId;
+  modelIdentity ??= (await fallbackSelection(worktree,phase,process.env,fetcher,registryPath)).modelId;
 
   const task = providerMode==="openrouter-free"?fallbackTask(worktree):[`GitHub issue #${issue.number}: ${issue.title}`, "", issue.body].join("\n");
-  const finalResponse = await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity);
+  const finalResponse = await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity,executor,isolation);
 
   stageCodexChanges(worktree, baselineUntracked);
   const commit = commitAndPush(worktree, branch, issue.title);
@@ -447,7 +496,7 @@ async function runGitHubIssueMode(repo: string, issueNumber: number, base: strin
   console.log(`[controller] draft PR: ${prUrl}`);
 }
 
-async function runManualMode(repo: string, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode,providerMode:"primary"|"openrouter-free",modelIdentity?:string): Promise<void> {
+async function runManualMode(repo: string, base: string, statePath: string, phase: CodexPhase, threadMode: ThreadMode,providerMode:"primary"|"openrouter-free",modelIdentity?:string,executor?:CodexExecutor,isolation:FallbackIsolation={},fetcher:typeof fetch=fetch,registryPath?:string): Promise<void> {
   const taskKey = process.env.CODEX_TASK_KEY;
   const configuredTask = process.env.CODEX_TASK;
   if (!taskKey || (providerMode==="primary"&&!configuredTask)) {
@@ -460,16 +509,71 @@ async function runManualMode(repo: string, base: string, statePath: string, phas
   const worktreeRoot = resolve(process.env.CODEX_WORKTREE_ROOT ?? "../../../.codex-worktrees");
   const worktree = ensureWorktree(repo, taskKey, branch, base, worktreeRoot);
   if(providerMode==="openrouter-free")validateExistingLinkedWorktree(worktree);
-  modelIdentity ??= (await fallbackSelection(worktree,phase)).modelId;
+  modelIdentity ??= (await fallbackSelection(worktree,phase,process.env,fetcher,registryPath)).modelId;
   const task=providerMode==="openrouter-free"?fallbackTask(worktree):configuredTask!;
   const state = loadState(statePath);
-  await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity);
+  await runCodexTask(taskKey, task, worktree, branch, state, statePath, phase, threadMode,providerMode,modelIdentity,executor,isolation);
 }
 
 async function fallbackSelection(worktree:string,phase:CodexPhase,env:NodeJS.ProcessEnv=process.env,fetcher:typeof fetch=fetch,registryPath=resolve("../openrouter-free-selector/config/codex-compatible-free-models-v1.json")){const {canonicalPlanPath,computeWorktreeStateHash,provenancePaths,readPlanArtifact}=await import("@print-engineer/openrouter-free-selector");const key=env.OPENROUTER_API_KEY;if(!key?.trim())throw new Error("OPENROUTER_AUTH_MISSING");const target=parseReviewTarget(env.CODEX_REVIEW_TARGET);if(phase==="review"&&!target)throw new Error("INVALID_REVIEW_TARGET");const planPath=env.MODEL_PLAN_PATH;let plan,paths;if(phase!=="general"){if(!planPath)throw new Error("INVALID_PLAN_PATH");const canonical=canonicalPlanPath(worktree,planPath);const status=phase==="plan"||target==="plan"?"PROPOSED":"APPROVED";if(phase!=="plan")plan=readPlanArtifact(worktree,canonical,status);paths=provenancePaths(worktree,plan?.canonical??canonical);}const override=phase==="plan"?env.MODEL_PLAN:phase==="build"?env.MODEL_BUILD:target==="plan"?env.MODEL_PLAN_REVIEW:env.MODEL_REVIEW;return selectOpenRouter({phase,reviewTarget:target,key,fetcher,registryPath,plan,planProducerPath:paths?.plan,buildProducerPath:paths?.build,stateHash:phase==="review"&&target==="implementation"?computeWorktreeStateHash(worktree):undefined,override});}
-async function resolveExecutionProvider(mode:ReturnType<typeof parseProviderMode>){const status=mode==="openrouter-free"?undefined:await readPrimaryStatus();const provider=mode==="openrouter-free"?mode:decideProvider(mode,status!);return {provider,model:provider==="primary"?PREFERRED_MODEL:undefined};}
+async function resolveExecutionProvider(mode:ReturnType<typeof parseProviderMode>,readStatus:()=>Promise<PrimaryStatus>=()=>readPrimaryStatus()){const status=mode==="openrouter-free"?undefined:await readStatus();const provider=mode==="openrouter-free"?mode:decideProvider(mode,status!);return {provider,model:provider==="primary"?PREFERRED_MODEL:undefined};}
 export interface ControllerDispatchDependencies {fetcher:typeof fetch;executor?:CodexExecutor;readPrimaryStatus?:()=>Promise<PrimaryStatus>;validateWorktree?:(worktree:string)=>string;gitStatus?:(worktree:string)=>string;selectFallback?:(worktree:string,phase:CodexPhase,env:NodeJS.ProcessEnv)=>Promise<any>;registryPath?:string;isolation?:FallbackIsolation}
-export async function dispatchControllerCommand(flags:string[],env:NodeJS.ProcessEnv=process.env,deps:ControllerDispatchDependencies={fetcher:fetch}):Promise<string[]|undefined>{if(flags.some(x=>!["--provider-status","--select-only","--compatibility-probe"].includes(x))||new Set(flags).size!==flags.length||flags.length>1)throw new Error("INVALID_COMMAND");const providerMode=parseProviderMode(env.CODEX_PROVIDER_MODE);const readStatus=deps.readPrimaryStatus??(()=>readPrimaryStatus());if(flags[0]==="--provider-status"){const status=providerMode==="openrouter-free"?undefined:await readStatus();const key=Boolean(env.OPENROUTER_API_KEY?.trim());const lines=statusLines(providerMode,status,key);if(providerMode==="primary")decideProvider(providerMode,status!);return lines;}if(flags[0]==="--compatibility-probe"){try{const {executeCompatibilityProbe,safeProbeLines}=await import("./compatibility-probe.js");if(!env.MODEL_WORKDIR)throw 0;const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));const report=await executeCompatibilityProbe(env,worktree,{fetcher:deps.fetcher,executor:deps.executor??new SdkCodexExecutor(),gitStatus:deps.gitStatus??(w=>git(w,"status","--short")),now:()=>new Date(),isolation:deps.isolation});return safeProbeLines(report);}catch(error){if(isFallbackIsolationError(error)||isCompatibilityProbeRateLimited(error))throw error;if(error instanceof CompatibilityProbeDiagnosticsError)throw error;throw new CompatibilityProbeDiagnosticsError(beforeExecutorDiagnostics());}}if(flags[0]==="--select-only"){if(providerMode!=="openrouter-free")throw new Error("SELECT_ONLY_REQUIRES_OPENROUTER_FREE");if(!env.MODEL_WORKDIR)throw new Error("INVALID_WORKTREE");const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));fallbackTask(worktree,env);const phase=parsePhase(env.CODEX_PHASE);const selected=deps.selectFallback?await deps.selectFallback(worktree,phase,env):await fallbackSelection(worktree,phase,env,deps.fetcher,deps.registryPath);return [`selector_source=openrouter`,`role=${selected.role}`,`model=${selected.modelId}`,`verified_free=true`,`context_length=${Math.min(selected.record.context_length,Number(selected.record.top_provider?.context_length))}`,`selection_mode=${selected.selectionMode}`];}return undefined;}
+export async function dispatchControllerCommand(flags:string[],env:NodeJS.ProcessEnv=process.env,deps:ControllerDispatchDependencies={fetcher:fetch}):Promise<string[]|undefined>{
+  if(flags.some(x=>!["--provider-status","--select-only","--compatibility-probe"].includes(x))||new Set(flags).size!==flags.length||flags.length>1)throw new Error("INVALID_COMMAND");
+  const providerMode=parseProviderMode(env.CODEX_PROVIDER_MODE);
+  const readStatus=deps.readPrimaryStatus??(()=>readPrimaryStatus());
+  if(flags[0]==="--provider-status"){
+    const status=providerMode==="openrouter-free"?undefined:await readStatus();
+    const key=Boolean(env.OPENROUTER_API_KEY?.trim());
+    const lines=statusLines(providerMode,status,key);
+    if(providerMode==="primary")decideProvider(providerMode,status!);
+    return lines;
+  }
+  if(flags[0]==="--compatibility-probe"){
+    try{
+      const {executeCompatibilityProbe,safeProbeLines}=await import("./compatibility-probe.js");
+      if(!env.MODEL_WORKDIR)throw 0;
+      const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));
+      const report=await executeCompatibilityProbe(env,worktree,{fetcher:deps.fetcher,executor:deps.executor??new SdkCodexExecutor(),gitStatus:deps.gitStatus??(w=>git(w,"status","--short")),now:()=>new Date(),isolation:deps.isolation});
+      return safeProbeLines(report);
+    }catch(error){
+      if(isFallbackIsolationError(error)||isCompatibilityProbeRateLimited(error))throw error;
+      if(error instanceof CompatibilityProbeDiagnosticsError)throw error;
+      throw new CompatibilityProbeDiagnosticsError(beforeExecutorDiagnostics());
+    }
+  }
+  if(flags[0]==="--select-only"){
+    if(providerMode!=="openrouter-free")throw new Error("SELECT_ONLY_REQUIRES_OPENROUTER_FREE");
+    if(!env.MODEL_WORKDIR)throw new Error("INVALID_WORKTREE");
+    const worktree=(deps.validateWorktree??(w=>validateExistingLinkedWorktree(w,env)))(resolve(env.MODEL_WORKDIR));
+    fallbackTask(worktree,env);
+    const phase=parsePhase(env.CODEX_PHASE);
+    const selected=deps.selectFallback?await deps.selectFallback(worktree,phase,env):await fallbackSelection(worktree,phase,env,deps.fetcher,deps.registryPath);
+    return [`selector_source=openrouter`,`role=${selected.role}`,`model=${selected.modelId}`,`verified_free=true`,`context_length=${Math.min(selected.record.context_length,Number(selected.record.top_provider?.context_length))}`,`selection_mode=${selected.selectionMode}`];
+  }
+  // Normal execution path (no special flags)
+  if (flags.length === 0) {
+    const { provider, model } = await resolveExecutionProvider(providerMode, readStatus);
+    const finalProviderMode = provider === "primary" ? "primary" : "openrouter-free";
+    const phase = parsePhase(env.CODEX_PHASE);
+    const threadMode = parseThreadMode(env.CODEX_THREAD_MODE, phase);
+    const repo = resolve(env.CODEX_REPO ?? "../..");
+    const statePath = resolve(env.CODEX_STATE ?? ".codex/controller-state.json");
+    const base = env.CODEX_BASE_BRANCH?.trim() || "master";
+
+    if (env.CODEX_ISSUE_NUMBER) {
+      const issueNumber = parseInt(env.CODEX_ISSUE_NUMBER, 10);
+      if (isNaN(issueNumber)) throw new Error("INVALID_ISSUE_NUMBER");
+      await runGitHubIssueMode(repo, issueNumber, base, statePath, phase, threadMode, finalProviderMode, model, deps.executor, deps.isolation, deps.fetcher, deps.registryPath);
+    } else if (env.CODEX_TASK_KEY) {
+      await runManualMode(repo, base, statePath, phase, threadMode, finalProviderMode, model, deps.executor, deps.isolation, deps.fetcher, deps.registryPath);
+    } else {
+      throw new Error("Set CODEX_ISSUE_NUMBER for GitHub mode, or CODEX_TASK_KEY and CODEX_TASK for manual mode.");
+    }
+    return undefined;
+  }
+  return undefined;
+}
 
 export async function runControllerCli(flags:string[],env:NodeJS.ProcessEnv,deps:ControllerDispatchDependencies={fetcher:fetch},writeLine:(line:string)=>void=console.log,writeError:(line:string)=>void=console.error):Promise<number>{try{const dispatched=await dispatchControllerCommand(flags,env,deps);if(dispatched){for(const line of dispatched)writeLine(line);}return 0;}catch(error){const message=error instanceof Error?error.message:"CONTROLLER_FAILED";writeError(/^[A-Z][A-Z0-9_]*$/.test(message)?message:"COMPATIBILITY_PROBE_FAILED");if(error instanceof CompatibilityProbeDiagnosticsError)for(const line of diagnosticLines(error.diagnostics))writeError(line);return 1;}}
 async function main(): Promise<void> {

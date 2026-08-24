@@ -1,4 +1,4 @@
-"""``printer.status`` MCP tool: read-only printer status (Phase 2+).
+"""Read-only ``printer.*`` MCP tools (Phase 2+).
 
 Strictly read-only: resolves the configured printer, calls
 ``BambuPrinterAdapter.get_status()``, and returns the normalized status.
@@ -12,13 +12,24 @@ Returns ``{"ok": true, "status": {...}, "summary": "...", "assessment":
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from math import floor, isfinite
 from typing import Any, cast
 
 from print_engineer.adapters.printer.bambu import BambuPrinterAdapter
+from print_engineer.adapters.printer.issue_metadata import (
+    IssueMetadataResolution,
+    load_issue_metadata,
+    resolve_issue_metadata,
+)
 from print_engineer.config import Settings
-from print_engineer.core.types import PrinterState, PrinterStatus
+from print_engineer.core.types import (
+    PrinterIssue,
+    PrinterIssueSource,
+    PrinterState,
+    PrinterStatus,
+)
 from print_engineer.errors import PrinterError, PrinterNotConfigured
 
 
@@ -74,6 +85,77 @@ def _serialize_status(status: PrinterStatus) -> dict[str, Any]:
             for issue in status.issues
         ],
     }
+
+
+def _issue_info_error(field: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "code": "issue_info_invalid_request",
+            "message": "Invalid printer issue lookup request.",
+            "details": {"field": field, "reason": reason},
+        },
+    }
+
+
+def _metadata_error() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "code": "issue_info_metadata_invalid",
+            "message": "Configured printer issue metadata is invalid.",
+            "details": {},
+        },
+    }
+
+
+def _serialize_issue_resolution(
+    resolution: IssueMetadataResolution,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "issue": {
+            "source": resolution.issue.source.value,
+            "code": resolution.issue.code,
+        },
+        "resolved": resolution.resolved,
+        "metadata": None,
+    }
+    if resolution.resolved:
+        metadata = resolution.metadata
+        assert metadata is not None
+        payload["metadata"] = {
+            "message": metadata.message,
+            "locale": metadata.locale,
+            "vendor": metadata.vendor,
+            "vendor_dataset_version": metadata.vendor_dataset_version,
+            "resource_schema_version": metadata.resource_schema_version,
+            "provenance_origin": metadata.provenance_origin,
+            "content_sha256": metadata.content_sha256,
+        }
+    else:
+        payload["reason"] = "no_match"
+    return payload
+
+
+def _validate_issue_info_request(
+    source: str, code: str, locale: str
+) -> tuple[PrinterIssueSource, str] | dict[str, Any]:
+    if source not in ("hms", "print_error"):
+        return _issue_info_error("source", "unsupported_source")
+    if source == "hms":
+        if len(code) != 16 or any(char not in "0123456789ABCDEF" for char in code):
+            return _issue_info_error("code", "invalid_hms_code")
+    elif (
+        len(code) != 8
+        or any(char not in "0123456789ABCDEF" for char in code)
+        or int(code, 16) == 0
+        or int(code, 16) > 0x7FFFFFFF
+    ):
+        return _issue_info_error("code", "invalid_print_error_code")
+    if not re.fullmatch(r"[a-z]{2}(?:-[A-Z]{2})?", locale):
+        return _issue_info_error("locale", "invalid_locale")
+    return PrinterIssueSource(source), code
 
 
 _STATE_SUMMARIES = {
@@ -234,10 +316,38 @@ class PrinterTools:
             "assessment": _assess_status(status),
         }
 
+    def issue_info(
+        self,
+        source: str,
+        code: str,
+        locale: str,
+        allow_english_fallback: bool,
+    ) -> dict[str, Any]:
+        """Resolve one supplied printer issue using local metadata only."""
+        validated = _validate_issue_info_request(source, code, locale)
+        if isinstance(validated, dict):
+            return validated
+        issue_source, issue_code = validated
+        issue = PrinterIssue(issue_source, issue_code)
+        loaded = load_issue_metadata(self._settings.printer.issue_metadata_paths)
+        if not loaded.ok:
+            return _metadata_error()
+        assert loaded.accepted is not None
+        serial = self._settings.secrets.serial or self._settings.printer.serial
+        resolution = resolve_issue_metadata(
+            issue,
+            serial,
+            locale,
+            allow_english_fallback,
+            loaded.accepted,
+        )
+        return _serialize_issue_resolution(resolution)
+
 
 def build_tools(settings: Settings) -> dict[str, Callable[..., dict[str, Any]]]:
     """Return the ``printer.*`` tool callables bound to *settings*."""
     tools = PrinterTools(settings)
     return {
         "printer.status": tools.status,
+        "printer.issue_info": tools.issue_info,
     }

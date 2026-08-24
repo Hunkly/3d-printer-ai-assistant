@@ -75,6 +75,10 @@ def _printer_tool_description(name: str) -> str:
             "temperatures, progress, and AMS slots. Never starts, stops, pauses, "
             "or resumes printing; never publishes MQTT messages; never slices."
         ),
+        "printer.issue_info": (
+            "Resolve one supplied Bambu printer issue against configured local metadata. "
+            "Read-only and local-only: never connects to or changes the printer."
+        ),
     }
     return descriptions.get(name, "Printer tool.")
 

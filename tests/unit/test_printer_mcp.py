@@ -33,7 +33,11 @@ from print_engineer.errors import (
     PrinterUnreachable,
 )
 from print_engineer.mcp.server import create_server
-from print_engineer.mcp.tools.printer import _assess_status, _format_status_summary
+from print_engineer.mcp.tools.printer import (
+    PrinterTools,
+    _assess_status,
+    _format_status_summary,
+)
 
 
 def _ok_status() -> PrinterStatus:
@@ -93,10 +97,13 @@ def _settings(
     secrets_ip: str | None = None,
     secrets_serial: str | None = None,
     access_code: str | None = None,
+    issue_metadata_paths: tuple[Path, ...] = (),
 ) -> Settings:
     return Settings(
         root=tmp_root,
-        printer=PrinterConfig(host=host, serial=serial),
+        printer=PrinterConfig(
+            host=host, serial=serial, issue_metadata_paths=issue_metadata_paths
+        ),
         secrets=BambuSecrets(
             ip=secrets_ip, serial=secrets_serial, access_code=access_code
         ),
@@ -141,6 +148,516 @@ def _call_tool(server: FastMCP, name: str, arguments: dict[str, object]) -> str:
 
 def _call_status(server: FastMCP) -> dict[str, Any]:
     return json.loads(_call_tool(server, "printer.status", {}))
+
+
+def _write_issue_resource(
+    path: Path,
+    *,
+    locale: str = "en",
+    family: str = "A01",
+    entries: list[dict[str, str]] | None = None,
+) -> bytes:
+    raw = json.dumps(
+        {
+            "schema_version": 1,
+            "vendor": "bambu_lab",
+            "vendor_dataset_version": "202608141853",
+            "device_family": family,
+            "locale": locale,
+            "entries": entries
+            or [
+                {
+                    "source": "hms",
+                    "lookup_key": "0300123400020056",
+                    "message": "HMS explanation",
+                },
+                {
+                    "source": "print_error",
+                    "lookup_key": "0012ABCD",
+                    "message": "Print error explanation",
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    return raw
+
+
+def _call_issue_info(
+    server: FastMCP,
+    *,
+    source: str = "hms",
+    code: str = "0300123400020056",
+    locale: str = "en",
+    allow_english_fallback: bool = False,
+) -> dict[str, Any]:
+    return json.loads(
+        _call_tool(
+            server,
+            "printer.issue_info",
+            {
+                "source": source,
+                "code": code,
+                "locale": locale,
+                "allow_english_fallback": allow_english_fallback,
+            },
+        )
+    )
+
+
+def test_server_registers_issue_info_with_four_required_fields(
+    server: FastMCP,
+) -> None:
+    async def run() -> Any:
+        async with Client(server) as client:
+            tools = await client.list_tools()
+        matches = [tool for tool in tools if tool.name == "printer.issue_info"]
+        assert len(matches) == 1
+        return matches[0]
+
+    tool = asyncio.run(run())
+    assert set(tool.inputSchema["properties"]) == {
+        "source",
+        "code",
+        "locale",
+        "allow_english_fallback",
+    }
+    assert set(tool.inputSchema["required"]) == {
+        "source",
+        "code",
+        "locale",
+        "allow_english_fallback",
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"source": "hms", "code": "0300123400020056", "locale": "en"},
+        {
+            "source": "hms",
+            "code": 123,
+            "locale": "en",
+            "allow_english_fallback": False,
+        },
+        {
+            "source": "hms",
+            "code": "0300123400020056",
+            "locale": "en",
+            "allow_english_fallback": False,
+            "extra": True,
+        },
+    ],
+    ids=["missing-required", "wrong-primitive-type", "unexpected-extra"],
+)
+def test_fastmcp_rejects_issue_info_schema_before_tool_body(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, object],
+) -> None:
+    def body_sentinel(
+        self: PrinterTools,
+        source: str,
+        code: str,
+        locale: str,
+        allow_english_fallback: bool,
+    ) -> dict[str, Any]:
+        raise AssertionError("issue_info body was reached")
+
+    monkeypatch.setattr(PrinterTools, "issue_info", body_sentinel)
+    server = _server_with(_settings(tmp_root))
+    with pytest.raises(Exception) as caught:
+        _call_tool(server, "printer.issue_info", arguments)
+    assert not isinstance(caught.value, AssertionError)
+    assert "issue_info_invalid_request" not in str(caught.value)
+
+
+def test_issue_info_resolves_hms_and_print_error_without_adapter(
+    tmp_root: Path, fake_adapter: type[_FakeAdapter]
+) -> None:
+    path = tmp_root / "issues.json"
+    raw = _write_issue_resource(path)
+    server = _server_with(
+        _settings(
+            tmp_root,
+            serial="A01-serial",
+            issue_metadata_paths=(path,),
+        )
+    )
+
+    hms = _call_issue_info(server)
+    assert hms["issue"] == {"source": "hms", "code": "0300123400020056"}
+    assert hms["resolved"] is True
+    assert hms["metadata"] == {
+        "message": "HMS explanation",
+        "locale": "en",
+        "vendor": "bambu_lab",
+        "vendor_dataset_version": "202608141853",
+        "resource_schema_version": 1,
+        "provenance_origin": "user_supplied",
+        "content_sha256": __import__("hashlib").sha256(raw).hexdigest(),
+    }
+    assert "path" not in json.dumps(hms)
+
+    print_error = _call_issue_info(
+        server, source="print_error", code="0012ABCD"
+    )
+    assert print_error["metadata"]["message"] == "Print error explanation"
+    assert fake_adapter.instances == []
+
+
+@pytest.mark.parametrize(
+    ("source", "code", "expected"),
+    [
+        ("hms", "0300123400020056", None),
+        ("hms", "03001234000200ab", "invalid_hms_code"),
+        ("hms", "030012340002005", "invalid_hms_code"),
+        ("hms", "030012340002005G", "invalid_hms_code"),
+        ("hms", " 0300123400020056", "invalid_hms_code"),
+        ("hms", "0x300123400020056", "invalid_hms_code"),
+        ("print_error", "00000001", None),
+        ("print_error", "7FFFFFFF", None),
+        ("print_error", "0012abcd", "invalid_print_error_code"),
+        ("print_error", "0012ABC", "invalid_print_error_code"),
+        ("print_error", "12AB34G6", "invalid_print_error_code"),
+        ("print_error", "00000000", "invalid_print_error_code"),
+        ("print_error", "80000000", "invalid_print_error_code"),
+        ("print_error", " 0012ABCD", "invalid_print_error_code"),
+        ("print_error", "0x12ABCD", "invalid_print_error_code"),
+    ],
+)
+def test_issue_info_complete_code_validation_matrix(
+    tmp_root: Path, source: str, code: str, expected: str | None
+) -> None:
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root)), source=source, code=code
+    )
+    if expected is None:
+        assert payload["ok"] is True
+    else:
+        assert payload == {
+            "ok": False,
+            "error": {
+                "code": "issue_info_invalid_request",
+                "message": "Invalid printer issue lookup request.",
+                "details": {"field": "code", "reason": expected},
+            },
+        }
+
+
+@pytest.mark.parametrize("locale", ["EN", "en-us", "e", "en_US", " uk-UA"])
+def test_issue_info_locale_validation_matrix(tmp_root: Path, locale: str) -> None:
+    payload = _call_issue_info(_server_with(_settings(tmp_root)), locale=locale)
+    assert payload == {
+        "ok": False,
+        "error": {
+            "code": "issue_info_invalid_request",
+            "message": "Invalid printer issue lookup request.",
+            "details": {"field": "locale", "reason": "invalid_locale"},
+        },
+    }
+
+
+def test_issue_info_invalid_validation_order_is_source_code_locale(
+    tmp_root: Path,
+) -> None:
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root)),
+        source="wrong",
+        code="bad",
+        locale="EN",
+    )
+    assert payload["error"]["details"] == {
+        "field": "source",
+        "reason": "unsupported_source",
+    }
+
+
+@pytest.mark.parametrize(
+    ("source", "code", "locale", "expected"),
+    [
+        ("other", "0300123400020056", "en", {"field": "source", "reason": "unsupported_source"}),
+        ("HMS", "0300123400020056", "en", {"field": "source", "reason": "unsupported_source"}),
+        ("hms", "030012340002005g", "en", {"field": "code", "reason": "invalid_hms_code"}),
+        ("hms", "03001234", "en", {"field": "code", "reason": "invalid_hms_code"}),
+        ("print_error", "00000000", "en", {"field": "code", "reason": "invalid_print_error_code"}),
+        ("print_error", "12AB34G6", "en", {"field": "code", "reason": "invalid_print_error_code"}),
+        ("hms", "0300123400020056", "EN", {"field": "locale", "reason": "invalid_locale"}),
+    ],
+)
+def test_issue_info_invalid_request_contract(
+    tmp_root: Path,
+    source: str,
+    code: str,
+    locale: str,
+    expected: dict[str, str],
+) -> None:
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root)),
+        source=source,
+        code=code,
+        locale=locale,
+    )
+    assert payload == {
+        "ok": False,
+        "error": {
+            "code": "issue_info_invalid_request",
+            "message": "Invalid printer issue lookup request.",
+            "details": expected,
+        },
+    }
+
+
+def test_issue_info_unresolved_and_english_fallback_are_publicly_stable(
+    tmp_root: Path,
+) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path, locale="en")
+    server = _server_with(
+        _settings(tmp_root, serial="A01", issue_metadata_paths=(path,))
+    )
+    unresolved = _call_issue_info(server, locale="de")
+    assert unresolved == {
+        "ok": True,
+        "issue": {"source": "hms", "code": "0300123400020056"},
+        "resolved": False,
+        "metadata": None,
+        "reason": "no_match",
+    }
+    fallback = _call_issue_info(server, locale="de", allow_english_fallback=True)
+    assert fallback["resolved"] is True
+    assert fallback["metadata"]["locale"] == "en"
+
+
+@pytest.mark.parametrize("kind", ["missing", "non-regular", "malformed"])
+def test_issue_info_metadata_failures_are_redacted(
+    tmp_root: Path, kind: str
+) -> None:
+    path = tmp_root / ("private-name.json" if kind == "malformed" else "missing.json")
+    if kind == "non-regular":
+        path.mkdir(parents=True)
+    elif kind == "malformed":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"private": "resource-content"}', encoding="utf-8")
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root, issue_metadata_paths=(path,)))
+    )
+    assert payload == {
+        "ok": False,
+        "error": {
+            "code": "issue_info_metadata_invalid",
+            "message": "Configured printer issue metadata is invalid.",
+            "details": {},
+        },
+    }
+    serialized = json.dumps(payload)
+    assert str(path) not in serialized
+    assert path.name not in serialized
+    assert "resource-content" not in serialized
+    assert "IssueMetadata" not in serialized
+    assert "source_reference" not in serialized
+    assert "serial" not in serialized
+    assert "access" not in serialized
+    assert "host" not in serialized
+
+
+def test_issue_info_empty_metadata_config_is_normal_no_match(tmp_root: Path) -> None:
+    payload = _call_issue_info(_server_with(_settings(tmp_root)))
+    assert payload == {
+        "ok": True,
+        "issue": {"source": "hms", "code": "0300123400020056"},
+        "resolved": False,
+        "metadata": None,
+        "reason": "no_match",
+    }
+
+
+def test_issue_info_loads_metadata_once_per_invocation_and_does_not_cache(
+    tmp_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import print_engineer.mcp.tools.printer as printer_module
+
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+    calls = 0
+    original = printer_module.load_issue_metadata
+
+    def spy(paths: tuple[Path, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(paths)
+
+    monkeypatch.setattr(printer_module, "load_issue_metadata", spy)
+    tool = PrinterTools(_settings(tmp_root, serial="A01", issue_metadata_paths=(path,)))
+    first = tool.issue_info("hms", "0300123400020056", "en", False)
+    path.write_bytes(_write_issue_resource(path, entries=[{
+        "source": "hms", "lookup_key": "0300123400020056", "message": "changed"
+    }]))
+    second = tool.issue_info("hms", "0300123400020056", "en", False)
+    assert first["metadata"]["message"] == "HMS explanation"
+    assert second["metadata"]["message"] == "changed"
+    assert calls == 2
+
+
+def test_issue_info_serial_precedence_selects_observable_family(tmp_root: Path) -> None:
+    a01 = tmp_root / "a01.json"
+    b02 = tmp_root / "b02.json"
+    _write_issue_resource(a01, family="A01")
+    _write_issue_resource(b02, family="B02", entries=[{
+        "source": "hms", "lookup_key": "0300123400020056", "message": "secret family"
+    }])
+    payload = _call_issue_info(
+        _server_with(_settings(
+            tmp_root, serial="A01-config", secrets_serial="B02-secret",
+            issue_metadata_paths=(a01, b02),
+        ))
+    )
+    assert payload["metadata"]["message"] == "secret family"
+    assert "serial" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("serial", [None, "A", "A0!", "C03-serial"])
+def test_issue_info_invalid_or_unmapped_serial_is_no_match(
+    tmp_root: Path, serial: str | None
+) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root, serial=serial, issue_metadata_paths=(path,)))
+    )
+    assert payload["resolved"] is False
+    assert payload["reason"] == "no_match"
+
+
+def test_issue_info_case_preserves_family_for_resolution(tmp_root: Path) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path, family="a01")
+    # Family matching preserves case; a lower-case configured family matches a
+    # lower-case serial and is not normalized to upper-case.
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root, serial="a01-serial", issue_metadata_paths=(path,)))
+    )
+    assert payload["resolved"] is True
+    assert payload["metadata"]["locale"] == "en"
+
+
+def test_issue_info_resolution_matrix_and_source_isolation(tmp_root: Path) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path, entries=[
+        {"source": "hms", "lookup_key": "0300123400020056", "message": "HMS"},
+        {"source": "print_error", "lookup_key": "00000001", "message": "PE"},
+    ])
+    server = _server_with(_settings(tmp_root, serial="A01", issue_metadata_paths=(path,)))
+    hms = _call_issue_info(server)
+    assert hms["resolved"] is True
+    assert hms["issue"] == {"source": "hms", "code": "0300123400020056"}
+    assert hms["metadata"]["message"] == "HMS"
+    print_error = _call_issue_info(server, source="print_error", code="00000001")
+    assert print_error["resolved"] is True
+    assert print_error["issue"] == {"source": "print_error", "code": "00000001"}
+    assert print_error["metadata"]["message"] == "PE"
+    isolated = _call_issue_info(server, source="hms", code="0102030405060708")
+    assert isolated == {
+        "ok": True,
+        "issue": {"source": "hms", "code": "0102030405060708"},
+        "resolved": False,
+        "metadata": None,
+        "reason": "no_match",
+    }
+
+
+def test_issue_info_exact_locale_precedes_english_and_rejects_unrelated_locale(
+    tmp_root: Path,
+) -> None:
+    en = tmp_root / "en.json"
+    uk = tmp_root / "uk.json"
+    _write_issue_resource(en, locale="en")
+    _write_issue_resource(uk, locale="uk-UA", entries=[{
+        "source": "hms", "lookup_key": "0300123400020056", "message": "Українське"
+    }])
+    server = _server_with(_settings(tmp_root, serial="A01", issue_metadata_paths=(en, uk)))
+    exact = _call_issue_info(server, locale="uk-UA", allow_english_fallback=True)
+    assert exact["metadata"]["message"] == "Українське"
+    assert exact["metadata"]["locale"] == "uk-UA"
+    fallback = _call_issue_info(server, locale="fr", allow_english_fallback=True)
+    assert fallback["metadata"]["locale"] == "en"
+    disabled = _call_issue_info(server, locale="fr", allow_english_fallback=False)
+    assert disabled["resolved"] is False
+    unrelated = _call_issue_info(server, locale="de", allow_english_fallback=False)
+    assert unrelated["resolved"] is False
+
+
+@pytest.mark.parametrize("code", ["0102030405060708", "00000001"])
+def test_issue_info_unknown_code_is_no_match(tmp_root: Path, code: str) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root, serial="A01", issue_metadata_paths=(path,))),
+        source="print_error" if code == "00000001" else "hms",
+        code=code,
+    )
+    assert payload["ok"] is True
+    assert payload["resolved"] is False
+    assert payload["reason"] == "no_match"
+
+
+def test_issue_info_family_mismatch_and_determinism(tmp_root: Path) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+    server = _server_with(_settings(tmp_root, serial="B02", issue_metadata_paths=(path,)))
+    first = _call_issue_info(server)
+    second = _call_issue_info(server)
+    assert first == second
+    assert first["resolved"] is False
+    assert json.loads(json.dumps(first)) == first
+
+
+def test_issue_info_offline_sentinels_are_not_touched(
+    tmp_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import print_engineer.adapters.printer.bambu as bambu_module
+    import print_engineer.adapters.printer.transport as transport_module
+    import print_engineer.mcp.tools.printer as printer_module
+
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+
+    def fail_boundary(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("offline boundary touched")
+
+    def fail_status(self: PrinterTools) -> dict[str, Any]:
+        raise AssertionError("offline boundary touched")
+
+    monkeypatch.setattr(printer_module, "BambuPrinterAdapter", fail_boundary)
+    monkeypatch.setattr(printer_module, "_connection_params", fail_boundary)
+    monkeypatch.setattr(PrinterTools, "status", fail_status)
+    monkeypatch.setattr(bambu_module, "PahoMqttClientFactory", fail_boundary)
+    monkeypatch.setattr(transport_module, "PahoMqttClient", fail_boundary)
+    payload = _call_issue_info(
+        _server_with(_settings(tmp_root, serial="A01", issue_metadata_paths=(path,)))
+    )
+    assert payload["resolved"] is True
+
+
+def test_issue_info_does_not_change_printer_status_lifecycle(
+    tmp_root: Path, fake_adapter: type[_FakeAdapter]
+) -> None:
+    path = tmp_root / "issues.json"
+    _write_issue_resource(path)
+    server = _server_with(_settings(
+        tmp_root, host="10.0.0.5", serial="A01", access_code="1234",
+        issue_metadata_paths=(path,),
+    ))
+    issue = _call_issue_info(server)
+    status = _call_status(server)
+    assert issue["resolved"] is True
+    assert status["status"]["issues"] == []
+    assert status["summary"] == _format_status_summary(_ok_status())
+    assert status["assessment"]["code"] == "printer_printing"
+    assert len(fake_adapter.instances) == 1
+    assert fake_adapter.instances[0].get_status_calls == 1
 
 
 def test_server_registers_printer_status(server: FastMCP) -> None:

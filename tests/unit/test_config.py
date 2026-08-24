@@ -69,3 +69,40 @@ def test_bambu_secrets_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.secrets.ip == "192.168.0.10"
     assert settings.secrets.access_code == "1234abcd"
     assert settings.secrets.serial is None
+
+
+def test_issue_metadata_paths_default_empty() -> None:
+    assert Settings().printer.issue_metadata_paths == ()
+
+
+def test_issue_metadata_empty_printer_mapping_loads_without_resource(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("printer: {}\n", encoding="utf-8")
+    settings = Settings.load(config_path=config, root=tmp_path / "project-root")
+    assert settings.printer.issue_metadata_paths == ()
+
+
+def test_issue_metadata_paths_rebase_against_root(tmp_path: Path) -> None:
+    settings = Settings.model_validate(
+        {"root": tmp_path, "printer": {"issue_metadata_paths": ["metadata.json"]}}
+    )
+    assert settings.printer.issue_metadata_paths == (tmp_path / "metadata.json",)
+
+
+def test_issue_metadata_absolute_path_is_preserved(tmp_path: Path) -> None:
+    path = tmp_path / "metadata.json"
+    settings = Settings.model_validate(
+        {"root": tmp_path / "root", "printer": {"issue_metadata_paths": [path]}}
+    )
+    assert settings.printer.issue_metadata_paths == (path,)
+
+
+def test_issue_metadata_yaml_relative_path_uses_explicit_root(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "printer:\n  issue_metadata_paths:\n    - metadata.json\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "project-root"
+    settings = Settings.load(config_path=config, root=root)
+    assert settings.printer.issue_metadata_paths == (root / "metadata.json",)

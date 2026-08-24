@@ -49,6 +49,7 @@ class SlicerConfig(BaseModel):
 class PrinterConfig(BaseModel):
     host: str | None = None
     serial: str | None = None
+    issue_metadata_paths: tuple[Path, ...] = ()
 
 
 class AnalysisConfig(BaseModel):
@@ -135,6 +136,9 @@ class Settings(BaseModel):
         self.storage.workspace_dir = resolve(self.root, self.storage.workspace_dir)
         self.logging.log_dir = resolve(self.root, self.logging.log_dir)
         self.logging.json_log_path = resolve(self.root, self.logging.json_log_path)
+        self.printer.issue_metadata_paths = tuple(
+            resolve(self.root, path) for path in self.printer.issue_metadata_paths
+        )
 
     @classmethod
     def load(

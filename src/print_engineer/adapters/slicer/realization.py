@@ -194,7 +194,7 @@ class RealizationResource:
     kind: str
     identity: str
     content_sha256: str
-    reference: str | None = None
+    reference: ProfileReference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +442,15 @@ def realize_setup(
                         {
                             "capability": capability,
                             "kind": kind,
+                            "reference": {
+                                "identity": {
+                                    "name": ref.identity.name,
+                                    "kind": ref.identity.kind.value,
+                                    "setting_id": ref.identity.setting_id,
+                                },
+                                "materialized_name": ref.materialized_name,
+                                "content_sha256": ref.content_sha256,
+                            },
                             "content": json.loads(ref.content),
                             "overlay": [
                                 (entry.key, entry.value, entry.layer, entry.units)
@@ -454,6 +463,7 @@ def realize_setup(
                     )
                 ).hexdigest(),
                 ref.content_sha256,
+                ref,
             )
             for kind, ref in zip(("printer", "process", "filament"), refs, strict=True)
         )

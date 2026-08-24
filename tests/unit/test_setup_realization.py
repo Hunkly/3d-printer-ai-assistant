@@ -8,6 +8,7 @@ import math
 import subprocess
 import tempfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from print_engineer.adapters.slicer.profile import ProfileMaterializer, ProfileR
 from print_engineer.adapters.slicer.realization import (
     ORCA_CAPABILITY,
     OverlayEntry,
+    ProfileReference,
     RealizationResult,
     realize_setup,
 )
@@ -58,6 +60,18 @@ def _setup(*, store_name: str = "A1", nozzle: float = 0.4, plate: str = "cool_pl
 
 def _realize(store: Path, setup: SelectedSetup) -> RealizationResult:
     return realize_setup(setup, ProfileRepository(store))
+
+
+def _with_profile_authority(
+    setup: SelectedSetup, field: str, identity: ProfileIdentity
+) -> SelectedSetup:
+    if field == "printer":
+        return replace(setup, printer=identity)
+    if field == "process_profile":
+        return replace(setup, process_profile=identity)
+    if field == "filament_profile":
+        return replace(setup, filament_profile=identity)
+    raise AssertionError(f"unsupported profile field: {field}")
 
 
 @pytest.mark.parametrize(
@@ -582,7 +596,12 @@ def test_operational_profile_context_is_excluded_from_identity(store: Path, tmp_
     assert first.effective_inputs is not None and second.effective_inputs is not None
     assert first.effective_inputs.identity == second.effective_inputs.identity
     assert first.resources == second.resources
-    assert all(resource.reference is None for resource in first.resources + second.resources)
+    assert all(
+        resource.reference == getattr(first.effective_inputs, kind)
+        for resource, kind in zip(
+            first.resources, ("printer", "process", "filament"), strict=True
+        )
+    )
 
 
 def test_caller_owned_source_mutation_cannot_change_realization(store: Path) -> None:
@@ -737,6 +756,80 @@ def test_resource_identity_changes_with_semantic_content_not_formatting(store: P
     assert first.resources[0].identity != second.resources[0].identity
 
 
+@pytest.mark.parametrize(
+    ("kind", "profile_kind", "profile_name", "setup_field", "directory"),
+    [
+        ("printer", ProfileKind.PRINTER, "A1", "printer", "machine"),
+        ("process", ProfileKind.PROCESS, "0.20 Standard", "process_profile", "process"),
+        ("filament", ProfileKind.FILAMENT, "Generic PLA", "filament_profile", "filament"),
+    ],
+)
+def test_resources_preserve_exact_profile_references(
+    store: Path,
+    kind: str,
+    profile_kind: ProfileKind,
+    profile_name: str,
+    setup_field: str,
+    directory: str,
+) -> None:
+    path = store / "system" / "BBL" / directory / f"{profile_name}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["setting_id"] = f"{kind}-authority"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    setup = _with_profile_authority(
+        _setup(), setup_field, ProfileIdentity(profile_name, profile_kind, f"{kind}-authority")
+    )
+    result = _realize(store, setup)
+    assert result.succeeded and result.effective_inputs is not None
+    expected = getattr(result.effective_inputs, kind)
+    resource = result.resources[("printer", "process", "filament").index(kind)]
+    assert isinstance(resource.reference, ProfileReference)
+    assert resource.reference == expected
+    assert resource.reference.identity == getattr(setup, setup_field)
+
+
+@pytest.mark.parametrize(
+    ("kind", "directory", "filename", "profile_kind", "field"),
+    [
+        ("printer", "machine", "A1", ProfileKind.PRINTER, "printer"),
+        ("process", "process", "0.20 Standard", ProfileKind.PROCESS, "process_profile"),
+        ("filament", "filament", "Generic PLA", ProfileKind.FILAMENT, "filament_profile"),
+    ],
+)
+def test_same_content_different_profile_authority_changes_resource_identity(
+    store: Path,
+    kind: str,
+    directory: str,
+    filename: str,
+    profile_kind: ProfileKind,
+    field: str,
+) -> None:
+    original = store / "system" / "BBL" / directory / f"{filename}.json"
+    data = json.loads(original.read_text(encoding="utf-8"))
+    data["setting_id"] = "authority-a"
+    original.write_text(json.dumps(data), encoding="utf-8")
+    base = _setup()
+    base = _with_profile_authority(
+        base, field, ProfileIdentity(filename, profile_kind, "authority-a")
+    )
+    first = _realize(store, base)
+
+    alternate_dir = store / "user" / "same-content" / directory
+    alternate_dir.mkdir(parents=True)
+    alternate = dict(data)
+    alternate["setting_id"] = "authority-b"
+    (alternate_dir / f"{filename}.json").write_text(json.dumps(alternate), encoding="utf-8")
+    second_setup = _with_profile_authority(
+        base, field, ProfileIdentity(filename, profile_kind, "authority-b")
+    )
+    second = _realize(store, second_setup)
+    index = ("printer", "process", "filament").index(kind)
+    assert first.succeeded and second.succeeded
+    assert first.resources[index].identity != second.resources[index].identity
+    assert first.effective_inputs is not None and second.effective_inputs is not None
+    assert first.effective_inputs.identity != second.effective_inputs.identity
+
+
 def test_source_isolation_and_repeated_access_are_semantically_stable(store: Path) -> None:
     result = _realize(store, _setup())
     assert result.effective_inputs is not None
@@ -762,4 +855,5 @@ def test_realization_has_no_subprocess_or_filesystem_side_effects(
     monkeypatch.setattr(Path, "mkdir", fail)
     result = _realize(store, _setup())
     assert result.succeeded
-    assert result.resources[0].reference is None
+    assert result.effective_inputs is not None
+    assert result.resources[0].reference == result.effective_inputs.printer

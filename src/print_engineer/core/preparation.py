@@ -197,6 +197,18 @@ class SelectedSetup:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparationAuthority:
+    identity: PreparationIdentity
+    selected_setup: SelectedSetup
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not PreparationIdentity:
+            raise TypeError("identity must be a PreparationIdentity")
+        if type(self.selected_setup) is not SelectedSetup:
+            raise TypeError("selected_setup must be a SelectedSetup")
+
+
+@dataclass(frozen=True, slots=True)
 class ActualInputIdentity:
     """Immutable actual/effective inputs; never a second selected setup."""
 

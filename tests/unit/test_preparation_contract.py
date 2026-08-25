@@ -15,6 +15,7 @@ from print_engineer.core.preparation import (
     FinalArtifactIdentity,
     ModelIdentity,
     NotReadyPreparationResult,
+    PreparationAuthority,
     PreparationFailure,
     PreparationIdentity,
     ProfileIdentity,
@@ -421,6 +422,37 @@ def test_authoritative_nested_values_are_immutable_on_repeated_access() -> None:
         result.slice_result.warnings.append("changed")  # type: ignore[attr-defined]
     assert result.evidence[0].value == "setup-1"
     assert result.slice_result.warnings == ()
+
+
+def test_preparation_authority_is_frozen_value_semantic_and_preserves_exact_members() -> None:
+    identity = _identity()
+    setup = _setup()
+    authority = PreparationAuthority(identity, setup)
+    assert authority.identity is identity
+    assert authority.selected_setup is setup
+    assert authority == PreparationAuthority(identity, setup)
+    assert hash(authority) == hash(PreparationAuthority(identity, setup))
+    with pytest.raises(FrozenInstanceError):
+        authority.identity = identity  # type: ignore[misc]
+
+
+def test_preparation_authority_does_not_infer_goal_or_reconstruct_setup() -> None:
+    setup = _setup()
+    balanced = PreparationAuthority(
+        PreparationIdentity(ModelIdentity(Path("model.stl")), RecommendationGoal.BALANCED), setup
+    )
+    strength = PreparationAuthority(
+        PreparationIdentity(ModelIdentity(Path("model.stl")), RecommendationGoal.STRENGTH), setup
+    )
+    assert balanced.identity.goal is RecommendationGoal.BALANCED
+    assert strength.identity.goal is RecommendationGoal.STRENGTH
+    assert balanced.identity != strength.identity
+    assert balanced != strength
+    assert balanced.selected_setup is setup
+    with pytest.raises(AttributeError):
+        balanced.selected_setup.overrides.append(  # type: ignore[attr-defined]
+            AppliedOverride("wall_loops", 4)
+        )
 
 
 @pytest.mark.parametrize(

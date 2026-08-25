@@ -31,9 +31,12 @@ from print_engineer.adapters.slicer.realization import (
 from print_engineer.core.preparation import (
     ActualInputIdentity,
     ModelIdentity,
+    PreparationAuthority,
+    PreparationIdentity,
     ProfileIdentity,
     SelectedSetup,
 )
+from print_engineer.core.recommendation import RecommendationGoal
 from print_engineer.core.types import (
     ProfileInfo,
     ProfileKind,
@@ -72,12 +75,27 @@ def test_candidate_and_facts_reject_invalid_values() -> None:
 
 def test_success_shape_is_immutable_and_candidate_is_not_final_artifact() -> None:
     model = ModelIdentity(Path("cube.stl"), "a" * 64)
-    actual = ActualInputIdentity(SlicerKind.ORCA_SLICER, None, None, None, None, None, None)
+    setup = SelectedSetup(
+        SlicerKind.ORCA_SLICER,
+        ProfileIdentity("A1", ProfileKind.PRINTER),
+        0.4,
+        "cool_plate",
+        "PLA",
+        ProfileIdentity("PLA", ProfileKind.FILAMENT),
+        ProfileIdentity("process", ProfileKind.PROCESS),
+    )
+    authority = PreparationAuthority(
+        PreparationIdentity(model, RecommendationGoal.BALANCED), setup
+    )
+    actual = ActualInputIdentity(
+        setup.slicer, setup.printer, setup.nozzle_diameter_mm, setup.build_plate,
+        setup.material, setup.filament_profile, setup.process_profile, setup.overrides,
+    )
     candidate = CandidateSliceArtifact("run-1", Path("plate_1.gcode"), "gcode", "a" * 64, 3)
     success = SliceExecutionSuccess(
         "run-1",
         "realization",
-        model,
+        authority,
         actual,
         "OrcaSlicer",
         "2.3.2",
@@ -90,6 +108,17 @@ def test_success_shape_is_immutable_and_candidate_is_not_final_artifact() -> Non
     )
     assert success.candidate_artifact is candidate
     assert success.candidate_artifact.__class__.__name__ == "CandidateSliceArtifact"
+    assert success.preparation_authority is authority
+    assert not hasattr(success, "model_identity")
+    assert not hasattr(success, "preparation_identity")
+    assert not hasattr(success, "selected_setup")
+    with pytest.raises(ValueError, match="actual inputs"):
+        replace(
+            success,
+            preparation_authority=replace(
+                authority, selected_setup=replace(setup, nozzle_diameter_mm=0.6)
+            ),
+        )
     with pytest.raises(AttributeError):
         success.slice_run_id = "other"  # type: ignore[misc]
 
@@ -224,7 +253,11 @@ def realization_fixture(tmp_path: Path) -> tuple[RealizationResult, ModelIdentit
     model = tmp_path / "model.stl"
     model.write_bytes(b"solid model\n")
     digest = hashlib.sha256(model.read_bytes()).hexdigest()
-    return RealizationResult(setup, inputs, resources, True), ModelIdentity(model, digest)
+    model_identity = ModelIdentity(model, digest)
+    authority = PreparationAuthority(
+        PreparationIdentity(model_identity, RecommendationGoal.BALANCED), setup
+    )
+    return RealizationResult(authority, inputs, resources, True), model_identity
 
 
 class _FakeSlicer:
@@ -338,7 +371,7 @@ def test_orca_like_multiline_candidate_reaches_success(
         b"G28 X\nG28 Z P0 T140\nM17 D\nM620 S0A\nM624 AQAAAAAAAAA=\n"
         b"G1 X10.5 Y-2.3 E0.44 ; metadata\n"
     )
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     assert result.candidate_artifact.path == result.workspace_path / "plate_1.gcode"
     assert result.observed_facts.layer_count == 4
@@ -355,7 +388,7 @@ def test_realized_execution_success_and_source_preservation(
         b"; filament_density: 1.24\n; filament used [mm] = 12.5\n"
         b"; filament used [cm3] = 0.1\nG1 X1 Y1\n"
     )
-    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization)
     inputs = realization.effective_inputs
     assert inputs is not None
     assert isinstance(result, SliceExecutionSuccess)
@@ -389,14 +422,19 @@ def test_relative_source_resolves_once_and_hands_off_absolute_verified_path(
     monkeypatch.setattr(Path, "resolve", resolve_once)
     monkeypatch.chdir(caller)
     original_model = ModelIdentity(Path("model.stl"), digest)
-    slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
-        realization, original_model
+    realization = replace(
+        realization,
+        preparation_authority=replace(
+            realization.preparation_authority,
+            identity=replace(realization.preparation_authority.identity, model=original_model),
+        ),
     )
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     assert resolve_calls == 1
     assert original_model.path == Path("model.stl")
-    assert result.model_identity is original_model
+    assert result.preparation_authority.identity.model is original_model
     assert len(slicer.jobs) == 1
     job = cast(Any, slicer.jobs[0])
     assert job.model_path.is_absolute()
@@ -411,7 +449,7 @@ def test_absolute_source_remains_absolute_and_successful(
 ) -> None:
     realization, model = realization_fixture
     slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization, model)
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     job = cast(Any, slicer.jobs[0])
     assert job.model_path.is_absolute()
@@ -425,10 +463,18 @@ def test_missing_relative_source_does_not_search_or_invoke_slicer(
 ) -> None:
     realization, model = realization_fixture
     monkeypatch.chdir(tmp_path)
-    slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
-        realization, ModelIdentity(Path("missing.stl"), model.sha256)
+    realization = replace(
+        realization,
+        preparation_authority=replace(
+            realization.preparation_authority,
+            identity=replace(
+                realization.preparation_authority.identity,
+                model=ModelIdentity(Path("missing.stl"), model.sha256),
+            ),
+        ),
     )
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "invalid_source_model"
     assert slicer.calls == 0
@@ -453,7 +499,7 @@ def test_source_resolution_exceptions_are_invalid_source(
 
     monkeypatch.setattr(Path, "resolve", fail_resolve)
     slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization, model)
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "invalid_source_model"
     assert slicer.calls == 0
@@ -470,10 +516,18 @@ def test_relative_sha_mismatch_blocks_slicer(
     source = caller / "model.stl"
     source.write_bytes(b"verified source")
     monkeypatch.chdir(caller)
-    slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
-        realization, ModelIdentity(Path("model.stl"), "0" * 64)
+    realization = replace(
+        realization,
+        preparation_authority=replace(
+            realization.preparation_authority,
+            identity=replace(
+                realization.preparation_authority.identity,
+                model=ModelIdentity(Path("model.stl"), "0" * 64),
+            ),
+        ),
     )
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "source_model_identity_mismatch"
     assert slicer.calls == 0
@@ -490,11 +544,20 @@ def test_relative_basename_collision_never_substitutes_workspace_file(
     source = caller / "model.stl"
     source.write_bytes(b"caller bytes")
     monkeypatch.chdir(caller)
-    slicer = _FakeSlicer()
-    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
+    realization = replace(
         realization,
-        ModelIdentity(Path("model.stl"), hashlib.sha256(source.read_bytes()).hexdigest()),
+        preparation_authority=replace(
+            realization.preparation_authority,
+            identity=replace(
+                realization.preparation_authority.identity,
+                model=ModelIdentity(
+                    Path("model.stl"), hashlib.sha256(source.read_bytes()).hexdigest()
+                ),
+            ),
+        ),
     )
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     job = cast(Any, slicer.jobs[0])
     collision = job.output_dir / "model.stl"
@@ -517,7 +580,14 @@ def test_source_model_gate_and_preservation(
     else:
         invalid = replace(model, sha256="0" * 64)
         expected = "source_model_identity_mismatch"
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization, invalid)
+    realization = replace(
+        realization,
+        preparation_authority=replace(
+            realization.preparation_authority,
+            identity=replace(realization.preparation_authority.identity, model=invalid),
+        ),
+    )
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == expected
     assert not list((tmp_path / "slicer" / "orca_slicer").glob("*"))
@@ -536,7 +606,7 @@ def test_unavailable_and_timeout_are_stage_owned(
     stage: str,
 ) -> None:
     realization, model = realization_fixture
-    result = SliceExecutor(tmp_path, cast(Any, _RaisingSlicer(error))).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _RaisingSlicer(error))).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == stage
     assert not list((tmp_path / "slicer" / "orca_slicer").glob("*"))
@@ -547,7 +617,7 @@ def test_missing_output_is_stage_owned_and_workspace_is_cleaned(
 ) -> None:
     realization, model = realization_fixture
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(write_output=False))).execute(
-        realization, model
+        realization
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slice_output_missing"
@@ -558,8 +628,8 @@ def test_effective_config_identity_is_semantic_and_workspace_independent(
     tmp_path: Path, realization_fixture: tuple[RealizationResult, ModelIdentity]
 ) -> None:
     realization, model = realization_fixture
-    first = SliceExecutor(tmp_path / "one", cast(Any, _FakeSlicer())).execute(realization, model)
-    second = SliceExecutor(tmp_path / "two", cast(Any, _FakeSlicer())).execute(realization, model)
+    first = SliceExecutor(tmp_path / "one", cast(Any, _FakeSlicer())).execute(realization)
+    second = SliceExecutor(tmp_path / "two", cast(Any, _FakeSlicer())).execute(realization)
     assert isinstance(first, SliceExecutionSuccess)
     assert isinstance(second, SliceExecutionSuccess)
     assert (
@@ -584,7 +654,7 @@ def test_each_resource_identity_is_authoritative(
     resources = list(realization.resources)
     resources[index] = replace(resources[index], identity="0" * 64)
     bad = replace(realization, resources=tuple(resources))
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(bad, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(bad)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
 
@@ -602,7 +672,7 @@ def test_each_profile_reference_identity_and_digest_are_checked(
     refs[index] = replace(refs[index], identity=ids[index])
     bad_inputs = replace(inputs, printer=refs[0], process=refs[1], filament=refs[2])
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(
-        replace(realization, effective_inputs=bad_inputs), model
+        replace(realization, effective_inputs=bad_inputs)
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -610,7 +680,7 @@ def test_each_profile_reference_identity_and_digest_are_checked(
     refs[index] = replace(refs[index], content_sha256="0" * 64)
     bad_inputs = replace(bad_inputs, printer=refs[0], process=refs[1], filament=refs[2])
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(
-        replace(realization, effective_inputs=bad_inputs), model
+        replace(realization, effective_inputs=bad_inputs)
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -631,7 +701,7 @@ def test_output_validation_distinguishes_malformed_and_missing_facts(
     stage: str,
 ) -> None:
     realization, model = realization_fixture
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == stage
 
@@ -643,7 +713,7 @@ def test_structural_gcode_rejects_malformed_commands(
     output: bytes,
 ) -> None:
     realization, model = realization_fixture
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slice_output_invalid"
 
@@ -659,7 +729,7 @@ def test_same_content_different_profile_authority_is_rejected(
     changed = replace(ref, identity=replace(ref.identity, setting_id="substitute"))
     resources[index] = replace(resources[index], reference=changed)
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(
-        replace(realization, resources=tuple(resources)), model
+        replace(realization, resources=tuple(resources))
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -670,7 +740,7 @@ def test_nonzero_process_wins_over_valid_output(
 ) -> None:
     realization, model = realization_fixture
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(return_code=1))).execute(
-        realization, model
+        realization
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slicer_process_failed"
@@ -683,7 +753,7 @@ def test_wrong_resource_kind_is_rejected(
     resources = list(realization.resources)
     resources[1] = replace(resources[1], kind="printer")
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(
-        replace(realization, resources=tuple(resources)), model
+        replace(realization, resources=tuple(resources))
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -708,7 +778,7 @@ def test_candidate_identity_failure_is_reachable(
     result = SliceExecutor(
         tmp_path,
         cast(Any, _FakeSlicer(b"G1 X1 Y1\n; total layer number: 2\n")),
-    ).execute(realization, model)
+    ).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "candidate_artifact_identity_failed"
 
@@ -776,7 +846,7 @@ def test_readback_tamper_prevents_orca(
         return original(paths, expected)
 
     monkeypatch.setattr(execution_module, "_verify_configs", tamper)
-    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_verification_failed"
     assert slicer.calls == 0
@@ -793,7 +863,7 @@ def test_authority_failures_block_orca_including_missing_reference_and_content_m
     resources[index] = replace(resources[index], reference=None)
     fake = _FakeSlicer()
     result = SliceExecutor(tmp_path, cast(Any, fake)).execute(
-        replace(realization, resources=tuple(resources)), model
+        replace(realization, resources=tuple(resources))
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -803,7 +873,7 @@ def test_authority_failures_block_orca_including_missing_reference_and_content_m
     resources[index] = replace(resources[index], content_sha256="0" * 64)
     fake = _FakeSlicer()
     result = SliceExecutor(tmp_path / "content", cast(Any, fake)).execute(
-        replace(realization, resources=tuple(resources)), model
+        replace(realization, resources=tuple(resources))
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -823,7 +893,7 @@ def test_same_content_different_authority_blocks_orca(
     )
     fake = _FakeSlicer()
     result = SliceExecutor(tmp_path, cast(Any, fake)).execute(
-        replace(realization, resources=tuple(resources)), model
+        replace(realization, resources=tuple(resources))
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "config_materialization_failed"
@@ -835,7 +905,7 @@ def test_success_materialization_and_evidence_are_independently_exact(
 ) -> None:
     realization, model = realization_fixture
     source_before = model.path.read_bytes()
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     inputs = realization.effective_inputs
     assert inputs is not None
@@ -861,7 +931,7 @@ def test_success_materialization_and_evidence_are_independently_exact(
             json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest() == identity
     assert result.realization_identity == inputs.identity
-    assert result.model_identity is model
+    assert result.preparation_authority is realization.preparation_authority
     assert result.actual_input_identity is inputs.actual_inputs
     assert (result.slicer_name, result.slicer_version) == ("OrcaSlicer", "2.3.2")
     candidate_bytes = result.candidate_artifact.path.read_bytes()
@@ -878,7 +948,7 @@ def test_blank_whitespace_and_comment_only_output_is_invalid(
     tmp_path: Path, realization_fixture: tuple[RealizationResult, ModelIdentity], output: bytes
 ) -> None:
     realization, model = realization_fixture
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slice_output_invalid"
 
@@ -889,7 +959,7 @@ def test_valid_candidate_with_optional_facts_absent_is_success(
     realization, model = realization_fixture
     result = SliceExecutor(
         tmp_path, cast(Any, _FakeSlicer(b"; total layer number: 3\nG1 X1 Y1\n"))
-    ).execute(realization, model)
+    ).execute(realization)
     assert isinstance(result, SliceExecutionSuccess)
     assert result.observed_facts == ObservedSliceFacts(1, 3, None, None, None, None, None)
 
@@ -914,7 +984,7 @@ def test_candidate_identity_read_and_stat_failures_are_stage_owned_and_cleaned(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, operation, fail_on_candidate)
-    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer())).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "candidate_artifact_identity_failed"
     assert not list((tmp_path / "slicer" / "orca_slicer").glob("*"))
@@ -926,7 +996,7 @@ def test_process_failure_cleans_workspace_and_preserves_source(
     realization, model = realization_fixture
     before = model.path.read_bytes()
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(return_code=7))).execute(
-        realization, model
+        realization
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slicer_process_failed"
@@ -960,7 +1030,7 @@ def test_auxiliary_archives_never_change_exact_candidate_authority(
             return result
 
     slicer = ArchiveSlicer(write_output=candidate)
-    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, slicer)).execute(realization)
     if stage is None:
         assert isinstance(result, SliceExecutionSuccess)
         assert result.candidate_artifact.path.name == "plate_1.gcode"
@@ -989,7 +1059,7 @@ def test_only_non_authoritative_output_is_missing(
             target.write_bytes(b"; total layer number: 1\nG1 X1\n")
             return SimpleNamespace(return_code=0)
 
-    result = SliceExecutor(tmp_path, cast(Any, OtherPathSlicer())).execute(realization, model)
+    result = SliceExecutor(tmp_path, cast(Any, OtherPathSlicer())).execute(realization)
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slice_output_missing"
 
@@ -1008,7 +1078,7 @@ def test_cleanup_failure_does_not_replace_underlying_process_failure(
         lambda _: (_ for _ in ()).throw(OSError("cleanup")),
     )
     result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(return_code=2))).execute(
-        realization, model
+        realization
     )
     assert isinstance(result, SliceExecutionFailure)
     assert result.stage == "slicer_process_failed"

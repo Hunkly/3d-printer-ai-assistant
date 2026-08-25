@@ -21,7 +21,11 @@ from print_engineer.adapters.slicer.realization import (
     RealizationResource,
     RealizationResult,
 )
-from print_engineer.core.preparation import ActualInputIdentity, ModelIdentity, SelectedSetup
+from print_engineer.core.preparation import (
+    ActualInputIdentity,
+    PreparationAuthority,
+    SelectedSetup,
+)
 from print_engineer.core.types import (
     ProfileInfo,
     ProfileSource,
@@ -251,7 +255,7 @@ class ObservedSliceFacts:
 class SliceExecutionSuccess:
     slice_run_id: str
     realization_identity: str
-    model_identity: ModelIdentity
+    preparation_authority: PreparationAuthority
     actual_input_identity: ActualInputIdentity
     slicer_name: str
     slicer_version: str
@@ -261,6 +265,16 @@ class SliceExecutionSuccess:
     filament_config_identity: str
     candidate_artifact: CandidateSliceArtifact
     observed_facts: ObservedSliceFacts
+
+    def __post_init__(self) -> None:
+        if type(self.preparation_authority) is not PreparationAuthority:
+            raise TypeError("preparation_authority must be a PreparationAuthority")
+        if type(self.actual_input_identity) is not ActualInputIdentity:
+            raise TypeError("actual_input_identity must be an ActualInputIdentity")
+        if not self.actual_input_identity.matches(self.preparation_authority.selected_setup):
+            raise ValueError(
+                "successful execution actual inputs must match selected setup"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,7 +356,6 @@ class SliceExecutor:
     def execute(
         self,
         realization: RealizationResult,
-        model_identity: ModelIdentity,
         *,
         timeout_seconds: float | None = None,
     ) -> SliceExecutionSuccess | SliceExecutionFailure:
@@ -350,6 +363,7 @@ class SliceExecutor:
         workspace: Path | None = None
         retained = False
         try:
+            model_identity = realization.preparation_authority.identity.model
             if not realization.succeeded or realization.effective_inputs is None:
                 return _failure(
                     run_id,
@@ -379,7 +393,9 @@ class SliceExecutor:
             inputs = realization.effective_inputs
             resources = realization.resources
             try:
-                _verify_resource_authority(inputs, realization.selected_setup, resources)
+                _verify_resource_authority(
+                    inputs, realization.preparation_authority.selected_setup, resources
+                )
                 configs, expected = _write_configs(inputs, resources, workspace)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 return _failure(run_id, "config_materialization_failed", str(exc))
@@ -473,7 +489,7 @@ class SliceExecutor:
             return SliceExecutionSuccess(
                 run_id,
                 inputs.identity,
-                model_identity,
+                realization.preparation_authority,
                 inputs.actual_inputs,
                 "OrcaSlicer",
                 "2.3.2",
@@ -512,12 +528,11 @@ class SliceExecutor:
 
 def execute_slice(
     realization: RealizationResult,
-    model_identity: ModelIdentity,
     *,
     workspace_root: str | Path,
     slicer: OrcaSlicerAdapter | None = None,
     timeout_seconds: float | None = None,
 ) -> SliceExecutionSuccess | SliceExecutionFailure:
     return SliceExecutor(workspace_root, slicer).execute(
-        realization, model_identity, timeout_seconds=timeout_seconds
+        realization, timeout_seconds=timeout_seconds
     )

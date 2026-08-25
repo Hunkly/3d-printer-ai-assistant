@@ -24,7 +24,16 @@ from print_engineer.adapters.slicer.realization import (
     RealizationResult,
     realize_setup,
 )
-from print_engineer.core.preparation import AppliedOverride, ProfileIdentity, SelectedSetup
+from print_engineer.core.preparation import (
+    ActualInputIdentity,
+    AppliedOverride,
+    ModelIdentity,
+    PreparationAuthority,
+    PreparationIdentity,
+    ProfileIdentity,
+    SelectedSetup,
+)
+from print_engineer.core.recommendation import RecommendationGoal
 from print_engineer.core.types import ProfileInfo, ProfileKind, SlicerKind
 
 
@@ -61,7 +70,15 @@ def _setup(*, store_name: str = "A1", nozzle: float = 0.4, plate: str = "cool_pl
 
 
 def _realize(store: Path, setup: SelectedSetup) -> RealizationResult:
-    return realize_setup(setup, ProfileRepository(store))
+    return realize_setup(
+        PreparationAuthority(
+            PreparationIdentity(
+                ModelIdentity(Path("model.stl")), RecommendationGoal.BALANCED
+            ),
+            setup,
+        ),
+        ProfileRepository(store),
+    )
 
 
 def _set_filament_type(store: Path, value: object, *, include: bool = True) -> None:
@@ -72,6 +89,59 @@ def _set_filament_type(store: Path, value: object, *, include: bool = True) -> N
     else:
         data.pop("filament_type", None)
     path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_realization_carries_one_authority_and_rejects_mismatched_success(
+    store: Path,
+) -> None:
+    setup = _setup()
+    authority = PreparationAuthority(
+        PreparationIdentity(ModelIdentity(Path("model.stl")), RecommendationGoal.BALANCED), setup
+    )
+    result = realize_setup(authority, ProfileRepository(store))
+    assert result.succeeded
+    assert result.preparation_authority is authority
+    assert result.effective_inputs is not None
+    assert result.effective_inputs.actual_inputs.matches(setup)
+
+    mismatched_actual = ActualInputIdentity(
+        setup.slicer,
+        setup.printer,
+        0.6,
+        setup.build_plate,
+        setup.material,
+        setup.filament_profile,
+        setup.process_profile,
+        setup.overrides,
+    )
+    with pytest.raises(ValueError, match="actual inputs"):
+        RealizationResult(
+            authority,
+            replace(result.effective_inputs, actual_inputs=mismatched_actual),
+            result.resources,
+            True,
+        )
+
+
+def test_equal_realized_inputs_keep_identity_semantics_across_goals(store: Path) -> None:
+    setup = _setup()
+    model = ModelIdentity(Path("model.stl"))
+    balanced = PreparationAuthority(
+        PreparationIdentity(model, RecommendationGoal.BALANCED), setup
+    )
+    strength = PreparationAuthority(PreparationIdentity(model, RecommendationGoal.STRENGTH), setup)
+    balanced_result = realize_setup(balanced, ProfileRepository(store))
+    strength_result = realize_setup(strength, ProfileRepository(store))
+    assert balanced_result.succeeded and strength_result.succeeded
+    assert balanced_result.preparation_authority is balanced
+    assert strength_result.preparation_authority is strength
+    assert balanced_result.effective_inputs is not None
+    assert strength_result.effective_inputs is not None
+    assert (
+        balanced_result.effective_inputs.actual_inputs
+        == strength_result.effective_inputs.actual_inputs
+    )
+    assert balanced_result.effective_inputs.identity == strength_result.effective_inputs.identity
 
 
 def _with_profile_authority(
@@ -252,7 +322,13 @@ def test_same_name_shadow_cannot_change_exact_setting_id_materialization(store: 
 
 
 def test_unsupported_capability_fails_closed(store: Path) -> None:
-    result = realize_setup(_setup(), ProfileRepository(store), capability="OrcaSlicer 2.4.0")
+    result = realize_setup(
+        PreparationAuthority(
+            PreparationIdentity(ModelIdentity("model.stl"), RecommendationGoal.BALANCED), _setup()
+        ),
+        ProfileRepository(store),
+        capability="OrcaSlicer 2.4.0",
+    )
     assert not result.succeeded
     assert result.failure is not None
     assert result.failure.code == "unsupported_slicer_version"
@@ -494,7 +570,13 @@ def test_each_profile_kind_rejects_wrong_kind_without_fallback(
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(ProfileRepository, "list_profiles", wrong_kind)
     try:
-        result = realization_module.realize_setup(_setup(), ProfileRepository(store))
+        result = realization_module.realize_setup(
+            PreparationAuthority(
+                PreparationIdentity(ModelIdentity("model.stl"), RecommendationGoal.BALANCED),
+                _setup(),
+            ),
+            ProfileRepository(store),
+        )
     finally:
         monkeypatch.undo()
     assert not result.succeeded
@@ -625,7 +707,9 @@ def test_resolved_profile_materialization_failure_is_atomic(
             raise InvalidProfile(f"cannot materialize {profile.name}")
 
     result = realize_setup(
-        _setup(),
+        PreparationAuthority(
+            PreparationIdentity(ModelIdentity("model.stl"), RecommendationGoal.BALANCED), _setup()
+        ),
         ProfileRepository(store),
         materializer=FailingMaterializer(ProfileRepository(store)),
     )

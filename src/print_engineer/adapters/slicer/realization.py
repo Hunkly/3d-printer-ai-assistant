@@ -19,9 +19,9 @@ from print_engineer.core.preparation import (
     ActualInputIdentity,
     AppliedOverride,
     FailureStage,
+    PreparationAuthority,
     PreparationFailure,
     ProfileIdentity,
-    SelectedSetup,
 )
 from print_engineer.core.types import ProfileInfo, SlicerKind
 from print_engineer.errors import InvalidProfile
@@ -227,11 +227,26 @@ class EffectiveSliceInputs:
 
 @dataclass(frozen=True, slots=True)
 class RealizationResult:
-    selected_setup: SelectedSetup
+    preparation_authority: PreparationAuthority
     effective_inputs: EffectiveSliceInputs | None
     resources: tuple[RealizationResource, ...]
     succeeded: bool
     failure: PreparationFailure | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.preparation_authority) is not PreparationAuthority:
+            raise TypeError("preparation_authority must be a PreparationAuthority")
+        if type(self.succeeded) is not bool:
+            raise TypeError("succeeded must be a boolean")
+        if self.succeeded:
+            if self.effective_inputs is None:
+                raise ValueError("successful realization requires effective inputs")
+            if not self.effective_inputs.actual_inputs.matches(
+                self.preparation_authority.selected_setup
+            ):
+                raise ValueError(
+                    "successful realization actual inputs must match selected setup"
+                )
 
 
 def _resolve(
@@ -273,15 +288,16 @@ def _overlay_value(item: AppliedOverride) -> tuple[str, str, str]:
 
 
 def realize_setup(
-    selected_setup: SelectedSetup,
+    preparation_authority: PreparationAuthority,
     repository: ProfileRepository,
     materializer: ProfileMaterializer | None = None,
     capability: str = ORCA_CAPABILITY,
 ) -> RealizationResult:
-    """Realize *selected_setup* without touching the filesystem or slicer."""
+    """Realize the selected setup in *preparation_authority*."""
+    selected_setup = preparation_authority.selected_setup
     if selected_setup.slicer is not SlicerKind.ORCA_SLICER or capability != ORCA_CAPABILITY:
         return RealizationResult(
-            selected_setup, None, (), False,
+            preparation_authority, None, (), False,
             PreparationFailure(FailureStage.REALIZATION, "unsupported_slicer_version",
                                "Only OrcaSlicer 2.3.2 realization is supported."),
         )
@@ -325,7 +341,7 @@ def realize_setup(
         compatible = process.compatible_printers
         if compatible and printer.name not in compatible:
             return _result_failure(
-                selected_setup,
+                preparation_authority,
                 "incompatible_profiles",
                 "process profile is not compatible with the selected printer",
             )
@@ -472,7 +488,7 @@ def realize_setup(
             )
             for kind, ref in zip(("printer", "process", "filament"), refs, strict=True)
         )
-        return RealizationResult(selected_setup, effective, resources, True, None)
+        return RealizationResult(preparation_authority, effective, resources, True, None)
     except LookupError as exc:
         code = "missing_profile"
         text = str(exc)
@@ -482,17 +498,19 @@ def realize_setup(
             code = "process_profile_missing"
         elif "filament" in text:
             code = "filament_profile_missing"
-        return _result_failure(selected_setup, code, text)
+        return _result_failure(preparation_authority, code, text)
     except RuntimeError as exc:
-        return _result_failure(selected_setup, "ambiguous_profile_resolution", str(exc))
+        return _result_failure(preparation_authority, "ambiguous_profile_resolution", str(exc))
     except _RealizationError as exc:
-        return _result_failure(selected_setup, exc.code, str(exc))
+        return _result_failure(preparation_authority, exc.code, str(exc))
     except (InvalidProfile, TypeError, ValueError, KeyError) as exc:
-        return _result_failure(selected_setup, "profile_content_invalid", str(exc))
+        return _result_failure(preparation_authority, "profile_content_invalid", str(exc))
 
 
-def _result_failure(setup: SelectedSetup, code: str, message: str) -> RealizationResult:
-    return RealizationResult(setup, None, (), False, PreparationFailure(
+def _result_failure(
+    preparation_authority: PreparationAuthority, code: str, message: str
+) -> RealizationResult:
+    return RealizationResult(preparation_authority, None, (), False, PreparationFailure(
         FailureStage.REALIZATION, code, message,
     ))
 
@@ -508,5 +526,5 @@ class SetupRealizer:
         self._repository = repository
         self._materializer = materializer
 
-    def realize(self, selected_setup: SelectedSetup) -> RealizationResult:
-        return realize_setup(selected_setup, self._repository, self._materializer)
+    def realize(self, preparation_authority: PreparationAuthority) -> RealizationResult:
+        return realize_setup(preparation_authority, self._repository, self._materializer)

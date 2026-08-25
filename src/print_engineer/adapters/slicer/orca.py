@@ -21,8 +21,8 @@ from print_engineer.adapters.slicer.base import BaseSlicerAdapter
 from print_engineer.adapters.slicer.gcode import parse_gcode, parse_gcode_3mf
 from print_engineer.adapters.slicer.process import run_cli
 from print_engineer.adapters.slicer.version import detect_orca_version
-from print_engineer.core.types import SliceJob, SliceResult, SlicerKind
-from print_engineer.errors import SlicerUnavailable, SliceTimeout
+from print_engineer.core.types import SliceJob, SliceResult, SlicerInfo, SlicerKind
+from print_engineer.errors import SliceFailed, SlicerUnavailable, SliceTimeout
 
 
 class OrcaSlicerAdapter(BaseSlicerAdapter):
@@ -63,6 +63,46 @@ class OrcaSlicerAdapter(BaseSlicerAdapter):
         three_mf = next(iter(sorted(job_dir.glob("*.gcode.3mf"))), None)
         return gcode, three_mf
 
+    def _slice_realized(self, job: SliceJob, info: SlicerInfo) -> SliceResult:
+        configs = job.realized_configs
+        assert configs is not None
+        job_dir = job.output_dir
+        if job_dir is None or not job_dir.is_dir():
+            raise SliceFailed("realized slice output directory does not exist")
+        candidate = job_dir / "plate_1.gcode"
+        archive = job_dir / f"{job.model_path.stem}.gcode.3mf"
+        if candidate.exists():
+            raise SliceFailed("realized slice workspace was not isolated")
+        command = self._build_slice_command(
+            info.executable,
+            job.model_path,
+            {"process": configs.process, "printer": configs.printer, "filament": configs.filament},
+            archive.name,
+            job_dir,
+        )
+        timeout = self._timeout_for(job)
+        try:
+            result = run_cli(command, timeout=timeout, cwd=job_dir)
+        except SlicerUnavailable:
+            raise
+        if result.timed_out:
+            raise SliceTimeout(
+                f"{self._adapter_name} exceeded the {timeout:.0f}s slice timeout",
+                details={
+                    "timeout_seconds": timeout,
+                    "output_dir": str(job_dir),
+                    "command": command,
+                },
+            )
+        return SliceResult(
+            job=job,
+            sliced_at=datetime.now(UTC),
+            output_3mf=archive if archive.is_file() else None,
+            gcode_path=candidate,
+            return_code=result.return_code,
+            notes=[f"sliced by {self._adapter_name} {info.version or 'unknown'}"],
+        )
+
     def slice(self, job: SliceJob) -> SliceResult:
         info = self._require_detected()
         if not info.slicing_supported:
@@ -74,6 +114,9 @@ class OrcaSlicerAdapter(BaseSlicerAdapter):
                     "reason": "unsupported_version",
                 },
             )
+
+        if job.realized_configs is not None:
+            return self._slice_realized(job, info)
 
         self._validate_model_locally(job.model_path)
         self._check_project_version(job.model_path, info.version)

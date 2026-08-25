@@ -121,6 +121,22 @@ class SlicerInfo:
     notes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RealizedConfigPaths:
+    """Run-owned, already-materialized configuration paths."""
+
+    printer: Path
+    process: Path
+    filament: Path
+
+    def __post_init__(self) -> None:
+        for name in ("printer", "process", "filament"):
+            value = getattr(self, name)
+            if not isinstance(value, (str, Path)) or not str(value).strip():
+                raise TypeError(f"{name} config path must be a non-blank path")
+            object.__setattr__(self, name, Path(value))
+
+
 @dataclass(frozen=True)
 class ModelValidation:
     """Outcome of validating a model against a slicer."""
@@ -145,6 +161,14 @@ class SliceJob:
     kind: SlicerKind = SlicerKind.ORCA_SLICER
     timeout_seconds: float | None = None
     export_name: str | None = None
+    realized_configs: RealizedConfigPaths | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.realized_configs is not None
+            and type(self.realized_configs) is not RealizedConfigPaths
+        ):
+            raise TypeError("realized_configs must be RealizedConfigPaths or None")
 
 
 @dataclass(frozen=True)

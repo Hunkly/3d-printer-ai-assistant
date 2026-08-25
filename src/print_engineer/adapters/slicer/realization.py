@@ -77,6 +77,15 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
+def _material_classification(value: object) -> str | None:
+    if isinstance(value, str):
+        return value if value and not value.isspace() else None
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        item = value[0]
+        return item if item and not item.isspace() else None
+    return None
+
+
 class _ExactRepository:
     """Repository view that prevents the materializer's name lookup from shadowing the root."""
 
@@ -346,12 +355,8 @@ def realize_setup(
                 "build_plate_not_representable", "unsupported build plate"
             )
         native_plate, observed_plate = _PLATES[plate_key]
-        material_value = filament_data.get("filament_type")
-        if (
-            not isinstance(material_value, str)
-            or not material_value
-            or material_value.isspace()
-        ):
+        material_value = _material_classification(filament_data.get("filament_type"))
+        if material_value is None:
             raise _RealizationError("material_not_provable", "filament material is unknown")
         if selected_setup.material != material_value:
             raise _RealizationError(

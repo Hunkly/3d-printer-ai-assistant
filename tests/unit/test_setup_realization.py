@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import math
 import subprocess
@@ -14,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from print_engineer.adapters.slicer.execution import _write_configs
 from print_engineer.adapters.slicer.profile import ProfileMaterializer, ProfileRepository
 from print_engineer.adapters.slicer.realization import (
     ORCA_CAPABILITY,
@@ -60,6 +62,16 @@ def _setup(*, store_name: str = "A1", nozzle: float = 0.4, plate: str = "cool_pl
 
 def _realize(store: Path, setup: SelectedSetup) -> RealizationResult:
     return realize_setup(setup, ProfileRepository(store))
+
+
+def _set_filament_type(store: Path, value: object, *, include: bool = True) -> None:
+    path = store / "system" / "BBL" / "filament" / "Generic PLA.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if include:
+        data["filament_type"] = value
+    else:
+        data.pop("filament_type", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def _with_profile_authority(
@@ -322,6 +334,73 @@ def test_material_case_and_upstream_whitespace_semantics(store: Path, material: 
         assert not result.succeeded
         assert result.failure is not None
         assert result.failure.code == "material_profile_mismatch"
+
+
+def test_singleton_filament_type_list_is_interpreted_without_rewriting_raw_content(
+    store: Path,
+) -> None:
+    _set_filament_type(store, ["PLA"])
+    result = _realize(store, _setup())
+    assert result.succeeded and result.effective_inputs is not None
+    raw = json.loads(result.effective_inputs.filament.content)
+    assert raw["filament_type"] == ["PLA"]
+    resource = result.resources[2]
+    assert resource.reference == result.effective_inputs.filament
+    assert json.loads(resource.reference.content)["filament_type"] == ["PLA"]
+    expected_digest = hashlib.sha256(
+        json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert resource.content_sha256 == expected_digest
+    repeated = _realize(store, _setup())
+    assert repeated.succeeded and repeated.effective_inputs is not None
+    assert repeated.effective_inputs.identity == result.effective_inputs.identity
+    assert repeated.resources[2].identity == resource.identity
+
+
+def test_singleton_filament_type_list_survives_realized_config_materialization(
+    store: Path, tmp_path: Path,
+) -> None:
+    _set_filament_type(store, ["PLA"])
+    result = _realize(store, _setup())
+    assert result.succeeded and result.effective_inputs is not None
+
+    inputs = result.effective_inputs
+    filament_resource = result.resources[2]
+    paths, expected = _write_configs(inputs, result.resources, tmp_path)
+    realized_filament = json.loads(paths.filament.read_text(encoding="utf-8"))
+
+    assert realized_filament["filament_type"] == ["PLA"]
+    assert expected[2]["filament_type"] == ["PLA"]
+    assert inputs.filament == filament_resource.reference
+    assert inputs.filament.identity == filament_resource.reference.identity
+    assert inputs.filament.identity == _setup().filament_profile
+    assert inputs.filament.identity.setting_id == _setup().filament_profile.setting_id
+    assert inputs.filament.content == filament_resource.reference.content
+    assert json.loads(inputs.filament.content)["filament_type"] == ["PLA"]
+
+
+@pytest.mark.parametrize("value", [[], ["PLA", "PETG"], ["PLA", 1], [1], "", [""], 123])
+def test_invalid_filament_type_representations_are_not_provable(
+    store: Path, value: object,
+) -> None:
+    _set_filament_type(store, value)
+    result = _realize(store, _setup())
+    assert not result.succeeded and result.failure is not None
+    assert result.failure.code == "material_not_provable"
+
+
+def test_missing_filament_type_is_not_provable(store: Path) -> None:
+    _set_filament_type(store, None, include=False)
+    result = _realize(store, _setup())
+    assert not result.succeeded and result.failure is not None
+    assert result.failure.code == "material_not_provable"
+
+
+def test_wrong_singleton_filament_type_is_a_material_mismatch(store: Path) -> None:
+    _set_filament_type(store, ["PETG"])
+    result = _realize(store, _setup())
+    assert not result.succeeded and result.failure is not None
+    assert result.failure.code == "material_profile_mismatch"
 
 
 def test_result_is_immutable(store: Path) -> None:

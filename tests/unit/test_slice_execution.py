@@ -18,6 +18,7 @@ from print_engineer.adapters.slicer.execution import (
     SliceExecutionFailure,
     SliceExecutionSuccess,
     SliceExecutor,
+    _is_structurally_valid_gcode,
 )
 from print_engineer.adapters.slicer.orca import OrcaSlicerAdapter
 from print_engineer.adapters.slicer.realization import (
@@ -253,6 +254,92 @@ class _RaisingSlicer:
 
     def slice(self, job: object) -> object:
         raise self.error
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "G1 X10 Y20",
+        "G1 X10.5 Y-2.3 E0.44",
+        "M104 S220",
+        "M9833.2",
+        "M1002 gcode_claim_action : 2",
+        "M1002 set_gcode_claim_speed_level : 2",
+        "M1002 set_filament_type:PLA-AERO",
+        "M1002 judge_flag build_plate_detect_flag",
+        "M1002 judge_last_extrude_cali_success",
+        "M1006 W",
+        "G28 X",
+        "G28 Z P0 T140",
+        "G28 Z P0 T300",
+        "M17",
+        "M17 D",
+        "M17 R S",
+        "M18 X Y Z",
+        "M211 R",
+        "M620 M",
+        "M620.1 E F523.843 T250",
+        "M620 S0A",
+        "M620 S255",
+        "M621 S0A",
+        "M621 S255",
+        "M624 AQAAAAAAAAA=",
+        "M900 C R S",
+    ],
+)
+def test_structural_validator_accepts_evidenced_orca_syntax(line: str) -> None:
+    assert _is_structurally_valid_gcode((line + "\n").encode())
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "G",
+        "Gfoo",
+        "M.2",
+        "G1.",
+        "G1.2.3",
+        "G1 garbage",
+        "G1 Xabc",
+        "G1 X",
+        "G28 Z",
+        "G28 Z P0",
+        "G28 Z T140",
+        "G28 Z Pabc T140",
+        "G28 Z P0 Tabc",
+        "M1002",
+        "M1002 gcode_claim_action : abc",
+        "M1002 unknown_payload",
+        "M104 garbage",
+        "M620 S1",
+        "M624 not-base64!",
+    ],
+)
+def test_structural_validator_rejects_malformed_or_unsupported_orca_syntax(line: str) -> None:
+    assert not _is_structurally_valid_gcode((line + "\n").encode())
+
+
+def test_structural_validator_preserves_comments_and_requires_command() -> None:
+    content = b"; HEADER_BLOCK_START\n\nM9833.2 ; inline metadata\n"
+    assert _is_structurally_valid_gcode(content)
+    assert not _is_structurally_valid_gcode(b"; HEADER_BLOCK_START\n\n")
+
+
+def test_orca_like_multiline_candidate_reaches_success(
+    tmp_path: Path, realization_fixture: tuple[RealizationResult, ModelIdentity]
+) -> None:
+    realization, model = realization_fixture
+    output = (
+        b"; total layer number: 4\n"
+        b"M9833.2\nM1002 gcode_claim_action : 2\n"
+        b"M1002 set_filament_type:PLA-AERO\nM1006 W\n"
+        b"G28 X\nG28 Z P0 T140\nM17 D\nM620 S0A\nM624 AQAAAAAAAAA=\n"
+        b"G1 X10.5 Y-2.3 E0.44 ; metadata\n"
+    )
+    result = SliceExecutor(tmp_path, cast(Any, _FakeSlicer(output))).execute(realization, model)
+    assert isinstance(result, SliceExecutionSuccess)
+    assert result.candidate_artifact.path == result.workspace_path / "plate_1.gcode"
+    assert result.observed_facts.layer_count == 4
 
 
 def test_realized_execution_success_and_source_preservation(

@@ -46,9 +46,33 @@ def _digest(value: object) -> str:
     return _digest_bytes(_canonical(value))
 
 
-_GCODE_COMMAND_RE = re.compile(r"^[GMTgmt]\d+$")
+_GCODE_COMMAND_RE = re.compile(r"^[GMTgmt][0-9]+(?:\.[0-9]+)?$")
 _GCODE_PARAMETER_RE = re.compile(
     r"^[A-Za-z][-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$"
+)
+_GCODE_BARE_FLAGS: dict[str, frozenset[str]] = {
+    "g28": frozenset({"X"}),
+    "m1006": frozenset({"W"}),
+    "m17": frozenset({"D", "R", "S"}),
+    "m18": frozenset({"X", "Y", "Z"}),
+    "m211": frozenset({"R", "S"}),
+    "m620": frozenset({"M"}),
+    "m620.1": frozenset({"E"}),
+    "m900": frozenset({"C", "R", "S"}),
+}
+_M1002_TEXT_RE = (
+    r"(?:gcode_claim_action\s*:\s*[0-9]+|"
+    r"set_gcode_claim_speed_level\s*:\s*[0-9]+|"
+    r"set_filament_type:[A-Za-z0-9_-]+|"
+    r"judge_flag [A-Za-z0-9_]+|"
+    r"judge_last_extrude_cali_success)"
+)
+_GCODE_M1002_RE = re.compile(rf"^M1002\s+{_M1002_TEXT_RE}$", re.IGNORECASE)
+_GCODE_M620_RE = re.compile(r"^M62[01]\s+S(?:0A|255)$", re.IGNORECASE)
+_GCODE_M624_RE = re.compile(
+    r"^M624\s+(?=[A-Za-z0-9+/=]+$)(?:[A-Za-z0-9+/]{4})*"
+    r"(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+    re.IGNORECASE,
 )
 
 
@@ -70,8 +94,39 @@ def _is_structurally_valid_gcode(content: bytes) -> bool:
         if not tokens or _GCODE_COMMAND_RE.fullmatch(tokens[0]) is None:
             return False
         command_found = True
-        if any(_GCODE_PARAMETER_RE.fullmatch(token) is None for token in tokens[1:]):
+        command = tokens[0].lower()
+        if command == "m1002":
+            if _GCODE_M1002_RE.fullmatch(code) is None:
+                return False
+            continue
+        if command in {"m620", "m621"}:
+            if _GCODE_M620_RE.fullmatch(code):
+                continue
+            if "." not in command and not (
+                command == "m620"
+                and tokens[1:]
+                and all(token.upper() in _GCODE_BARE_FLAGS[command] for token in tokens[1:])
+            ):
+                return False
+        if command == "m624":
+            if _GCODE_M624_RE.fullmatch(code):
+                continue
             return False
+        if command == "g28" and len(tokens) == 4 and tokens[1].upper() == "Z":
+            if (
+                tokens[2][:1].upper() == "P"
+                and tokens[3][:1].upper() == "T"
+                and _GCODE_PARAMETER_RE.fullmatch(tokens[2]) is not None
+                and _GCODE_PARAMETER_RE.fullmatch(tokens[3]) is not None
+            ):
+                continue
+            return False
+        allowed_flags = _GCODE_BARE_FLAGS.get(command, frozenset())
+        for token in tokens[1:]:
+            if len(token) == 1 and token.upper() in allowed_flags:
+                continue
+            if _GCODE_PARAMETER_RE.fullmatch(token) is None:
+                return False
     return command_found
 
 

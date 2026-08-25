@@ -51,8 +51,9 @@ _BAMBU_PLA = {
     "nozzle_temperature_range_low": "190",
     "nozzle_temperature_range_high": "230",
     "nozzle_temperature_initial_layer": "220",
-    "cool_plate_temp": "35",
-    "textured_plate_temp": "45",
+    "cool_plate_temp": ["35"],
+    "textured_plate_temp": ["45"],
+    "hot_plate_temp": ["55"],
     "compatible_printers": ["Bambu Lab A1"],
 }
 
@@ -136,6 +137,53 @@ def _adapter() -> FakeProfileAdapter:
     )
 
 
+def _plate_adapter(
+    data: Mapping[str, object],
+    *,
+    name: str = "Bambu PLA Basic @BBL A1",
+    material: str | None = None,
+) -> FakeProfileAdapter:
+    filament_data = dict(data)
+    if material is not None:
+        filament_data["filament_type"] = material
+    base = make_profile(ProfileKind.PRINTER, "Bambu Lab A1", _BASE, materialized=False)
+    variant = make_profile(
+        ProfileKind.PRINTER, "Bambu Lab A1 0.4 nozzle", _VARIANT_04, materialized=True
+    )
+    process = make_profile(ProfileKind.PROCESS, "0.20mm Standard @BBL A1", _PROCESS)
+    filament = make_profile(ProfileKind.FILAMENT, name, filament_data)
+    return FakeProfileAdapter(
+        profiles={
+            ProfileKind.PRINTER: [base, variant],
+            ProfileKind.PROCESS: [process],
+            ProfileKind.FILAMENT: [filament],
+        },
+        materialized={
+            "printer:Bambu Lab A1 0.4 nozzle": variant,
+            "process:0.20mm Standard @BBL A1": process,
+            f"filament:{name}": filament,
+        },
+    )
+
+
+class _CountingProfileAdapter(FakeProfileAdapter):
+    def __init__(self, source: FakeProfileAdapter) -> None:
+        super().__init__(source.profiles, source.materialized)
+        self.filament_lookups: dict[str, int] = {}
+
+    def find_profile(self, profile_kind: ProfileKind, name: str):  # type: ignore[no-untyped-def]
+        if profile_kind == ProfileKind.FILAMENT:
+            self.filament_lookups[name] = self.filament_lookups.get(name, 0) + 1
+        return super().find_profile(profile_kind, name)
+
+
+class _MissingMaterializedProfileAdapter(FakeProfileAdapter):
+    def find_profile(self, profile_kind: ProfileKind, name: str):  # type: ignore[no-untyped-def]
+        if profile_kind == ProfileKind.FILAMENT:
+            return None
+        return super().find_profile(profile_kind, name)
+
+
 def _settings() -> Settings:
     return Settings.load(root=Path("runtime/data").absolute())
 
@@ -204,7 +252,7 @@ class TestCompatibilityFilters:
     def test_build_plate_filter(self) -> None:
         adapter = _adapter()
         resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
-            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool plate")
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
         )
         matrix = FilamentMatrixBuilder(_settings(), adapter).build(
             resolved, goal=RecommendationGoal.BALANCED
@@ -214,6 +262,309 @@ class TestCompatibilityFilters:
         assert any(
             r.reason_code == "incompatible_build_plate" for r in matrix.rejected
         )
+
+    @pytest.mark.parametrize(
+        ("plate", "field", "other_field"),
+        [
+            ("cool_plate", "cool_plate_temp", "textured_plate_temp"),
+            ("textured_pei_plate", "textured_plate_temp", "cool_plate_temp"),
+            ("high_temp_plate", "hot_plate_temp", "cool_plate_temp"),
+        ],
+    )
+    def test_canonical_plate_uses_only_selected_materialized_field(
+        self, plate: str, field: str, other_field: str
+    ) -> None:
+        data = dict(_BAMBU_PLA)
+        data[field] = ["35"]
+        data[other_field] = ["0"]
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate=plate)
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert len(matrix.candidates) == 1
+
+    @pytest.mark.parametrize(
+        "plate",
+        [
+            "Cool Plate",
+            "Textured PEI Plate",
+            "High Temp Plate",
+            "cool plate",
+            "COOL_PLATE",
+            "hot",
+            "high temp",
+            "engineering",
+            "1",
+        ],
+    )
+    def test_unapproved_plate_vocabulary_fails_closed(self, plate: str) -> None:
+        adapter = _plate_adapter(_BAMBU_PLA)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate=plate)
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            [],
+            ["35", "40"],
+            "35",
+            35,
+            [35],
+            [""],
+            ["abc"],
+            ["-1"],
+            ["35.0"],
+            ["0.0"],
+            [" 35 "],
+            ["+35"],
+            ["1e2"],
+            ["NaN"],
+            ["nan"],
+            ["inf"],
+            ["Infinity"],
+        ],
+    )
+    def test_plate_value_grammar_fails_closed(self, value: object) -> None:
+        data: dict[str, object] = dict(_BAMBU_PLA)
+        data["cool_plate_temp"] = value
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_missing_selected_plate_field_is_incompatible(self) -> None:
+        data = dict(_BAMBU_PLA)
+        del data["cool_plate_temp"]
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_explicit_zero_decimal_text_is_incompatible(self) -> None:
+        data = dict(_BAMBU_PLA)
+        data["cool_plate_temp"] = ["0.0"]
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_profile_name_does_not_infer_plate_compatibility(self) -> None:
+        data = dict(_BAMBU_PLA)
+        data["cool_plate_temp"] = ["0"]
+        adapter = _plate_adapter(data, name="Bambu PLA Tough+ @base", material="PLA")
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_extremely_long_valid_positive_plate_value_is_accepted(self) -> None:
+        data = dict(_BAMBU_PLA)
+        data["cool_plate_temp"] = ["1" + "0" * 5000]
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert len(matrix.candidates) == 1
+
+    def test_selected_build_plate_remains_context_authority(self) -> None:
+        incompatible = dict(_BAMBU_PLA)
+        incompatible["cool_plate_temp"] = ["0"]
+        compatible_elsewhere = dict(_BAMBU_PLA)
+        compatible_elsewhere["cool_plate_temp"] = ["0"]
+        compatible_elsewhere["textured_plate_temp"] = ["45"]
+        compatible_cool = dict(_BAMBU_PLA)
+        adapter = _plate_adapter(
+            incompatible, name="Bambu PLA Tough+ @base", material="PLA"
+        )
+        adapter.profiles[ProfileKind.FILAMENT].append(
+            make_profile(ProfileKind.FILAMENT, "Neutral Material @base", compatible_elsewhere)
+        )
+        adapter.materialized["filament:Neutral Material @base"] = adapter.profiles[
+            ProfileKind.FILAMENT
+        ][-1]
+        adapter.profiles[ProfileKind.FILAMENT].append(
+            make_profile(ProfileKind.FILAMENT, "Cool Compatible @base", compatible_cool)
+        )
+        adapter.materialized["filament:Cool Compatible @base"] = adapter.profiles[
+            ProfileKind.FILAMENT
+        ][-1]
+
+        result = _engine(adapter).recommend(
+            SetupRequest(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        assert result.context.build_plate == "cool_plate"
+        assert result.matrix.build_plate == "cool_plate"
+        assert result.filament is not None
+
+    @pytest.mark.parametrize("value", [["35"], ["90"]])
+    def test_positive_integer_plate_values_are_accepted(self, value: list[str]) -> None:
+        data = dict(_BAMBU_PLA)
+        data["cool_plate_temp"] = value
+        adapter = _plate_adapter(data)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert len(matrix.candidates) == 1
+
+    def test_materialization_failure_is_incompatible_build_plate(self) -> None:
+        source = _plate_adapter(_BAMBU_PLA)
+        adapter = _MissingMaterializedProfileAdapter(source.profiles, source.materialized)
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_unparseable_materialized_document_is_incompatible_build_plate(self) -> None:
+        source = _plate_adapter(_BAMBU_PLA)
+        source.materialized["filament:Bambu PLA Basic @BBL A1"] = make_profile(
+            ProfileKind.FILAMENT,
+            "Bambu PLA Basic @BBL A1",
+            "not json",
+        )
+        resolved = PrintContextResolver(_settings(), adapter=source).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), source).build(resolved)
+
+        assert matrix.candidates == []
+        assert matrix.rejected[0].reason_code == "incompatible_build_plate"
+
+    def test_zero_is_rejected_before_ranking_and_positive_is_accepted(self) -> None:
+        zero = dict(_BAMBU_PLA)
+        zero["cool_plate_temp"] = ["0"]
+        positive = dict(_BAMBU_PLA)
+        positive["cool_plate_temp"] = ["35"]
+        adapter = _plate_adapter(zero, name="Bambu ABS @base", material="ABS")
+        adapter.profiles[ProfileKind.FILAMENT].append(
+            make_profile(ProfileKind.FILAMENT, "Bambu PLA Tough+ @base", positive)
+        )
+        adapter.materialized["filament:Bambu PLA Tough+ @base"] = adapter.profiles[
+            ProfileKind.FILAMENT
+        ][-1]
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert [candidate.profile_name for candidate in matrix.candidates] == [
+            "Bambu PLA Tough+ @base"
+        ]
+        assert any(
+            rejection.profile_name == "Bambu ABS @base"
+            and rejection.reason_code == "incompatible_build_plate"
+            for rejection in matrix.rejected
+        )
+
+    def test_explicit_abs_does_not_substitute_pla(self) -> None:
+        abs_data = dict(_BAMBU_PLA)
+        abs_data["filament_type"] = "ABS"
+        abs_data["cool_plate_temp"] = ["0"]
+        pla_data = dict(_BAMBU_PLA)
+        adapter = _plate_adapter(abs_data, name="Bambu ABS @base", material="ABS")
+        adapter.profiles[ProfileKind.FILAMENT].append(
+            make_profile(ProfileKind.FILAMENT, "Bambu PLA Tough+ @base", pla_data)
+        )
+        adapter.materialized["filament:Bambu PLA Tough+ @base"] = adapter.profiles[
+            ProfileKind.FILAMENT
+        ][-1]
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved, material="ABS")
+
+        assert matrix.candidates == []
+        assert any(r.reason_code == "incompatible_build_plate" for r in matrix.rejected)
+        assert not any(r.profile_name == "Bambu PLA Tough+ @base" for r in matrix.candidates)
+
+    def test_explicit_abs_empty_selection_has_no_selectable_filament(self) -> None:
+        abs_data = dict(_BAMBU_PLA)
+        abs_data["filament_type"] = "ABS"
+        abs_data["cool_plate_temp"] = ["0"]
+        adapter = _plate_adapter(abs_data, name="Bambu ABS @base", material="ABS")
+        result = _engine(adapter).recommend(
+            SetupRequest(
+                printer="Bambu Lab A1",
+                build_plate="cool_plate",
+                material="ABS",
+            )
+        )
+
+        assert result.matrix.candidates == []
+        assert result.material is None
+        assert result.filament is None
+        assert result.matrix.rejected
+        assert all(
+            rejection.reason_code == "incompatible_build_plate"
+            for rejection in result.matrix.rejected
+        )
+
+    def test_explicit_pla_positive_plate_value_is_selectable(self) -> None:
+        adapter = _plate_adapter(_BAMBU_PLA, material="PLA")
+        result = _engine(adapter).recommend(
+            SetupRequest(
+                printer="Bambu Lab A1",
+                build_plate="cool_plate",
+                material="PLA",
+            )
+        )
+
+        assert result.matrix.candidates
+        assert result.material is not None
+        assert result.filament is not None
+
+    def test_compatibility_uses_materialized_document_once(self) -> None:
+        adapter = _CountingProfileAdapter(_plate_adapter(_BAMBU_PLA))
+        resolved = PrintContextResolver(_settings(), adapter=adapter).resolve(
+            PrintContextIntent(printer="Bambu Lab A1", build_plate="cool_plate")
+        )
+
+        matrix = FilamentMatrixBuilder(_settings(), adapter).build(resolved)
+
+        assert matrix.candidates
+        assert adapter.filament_lookups == {"Bambu PLA Basic @BBL A1": 1}
 
     def test_material_filter(self) -> None:
         matrix = _matrix(_adapter(), RecommendationGoal.BALANCED, material="PLA")

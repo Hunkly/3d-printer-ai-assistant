@@ -21,6 +21,7 @@ Design rules:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from print_engineer.core.recommendation import (
@@ -66,12 +67,11 @@ _NEUTRAL_BRAND_TOKENS = frozenset(
 )
 
 _PLATE_FIELDS: dict[str, str] = {
-    "cool": "cool_plate_temperature_c",
-    "textured": "textured_plate_temperature_c",
-    "hot": "hot_plate_temperature_c",
-    "engineering": "hot_plate_temperature_c",
-    "high temp": "hot_plate_temperature_c",
+    "cool_plate": "cool_plate_temp",
+    "textured_pei_plate": "textured_plate_temp",
+    "high_temp_plate": "hot_plate_temp",
 }
+_PLATE_VALUE_RE = re.compile(r"(?:0|[1-9][0-9]*)")
 
 _GOAL_WEIGHTS: dict[RecommendationGoal, dict[str, float]] = {
     RecommendationGoal.PRINT_TIME: {"print_time": 1.0},
@@ -167,10 +167,19 @@ def _inconsistent(a: str, b: str) -> bool:
 
 
 def _plate_field(build_plate: str) -> str | None:
-    lower = build_plate.lower()
-    for key, field in _PLATE_FIELDS.items():
-        if key in lower:
-            return field
+    return _PLATE_FIELDS.get(build_plate)
+
+
+def _plate_support_error(data: dict[str, Any], plate_field: str) -> str | None:
+    """Return a fail-closed reason unless the materialized plate value proves support."""
+    value = data.get(plate_field)
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], str):
+        return f"{plate_field} must be a singleton string list with a positive integer"
+    text = value[0]
+    if _PLATE_VALUE_RE.fullmatch(text) is None:
+        return f"{plate_field} value {text!r} is not a plain decimal integer"
+    if text == "0":
+        return f"{plate_field} value is zero and does not support the selected plate"
     return None
 
 
@@ -347,12 +356,12 @@ class FilamentMatrixBuilder:
             )
 
         plate_field: str | None = None
-        if resolved.build_plate:
+        if resolved.build_plate is not None:
             plate_field = _plate_field(resolved.build_plate)
             if plate_field is None:
                 warnings.append(
-                    f"build plate {resolved.build_plate!r} could not be mapped to a profile "
-                    "plate temperature field; plate filter skipped"
+                    f"build plate {resolved.build_plate!r} is not an approved canonical "
+                    "plate key; compatibility cannot be proven"
                 )
 
         profiles = self._adapter.list_profiles(ProfileKind.FILAMENT)
@@ -395,8 +404,17 @@ class FilamentMatrixBuilder:
         if materialized is None:
             return None, RejectedFilamentCandidate(
                 profile_name=name,
-                reason_code="materialization_failed",
-                reason="the profile could not be resolved against the slicer store",
+                reason_code=(
+                    "incompatible_build_plate"
+                    if resolved.build_plate is not None
+                    else "materialization_failed"
+                ),
+                reason=(
+                    "selected build-plate compatibility cannot be proven because "
+                    "the profile could not be resolved against the slicer store"
+                    if resolved.build_plate is not None
+                    else "the profile could not be resolved against the slicer store"
+                ),
             )
 
         data = _read_json(materialized)
@@ -404,8 +422,17 @@ class FilamentMatrixBuilder:
         if not data:
             return None, RejectedFilamentCandidate(
                 profile_name=name,
-                reason_code="unparseable",
-                reason="profile content could not be parsed as JSON",
+                reason_code=(
+                    "incompatible_build_plate"
+                    if resolved.build_plate is not None
+                    else "unparseable"
+                ),
+                reason=(
+                    "selected build-plate compatibility cannot be proven because "
+                    "profile content could not be parsed as JSON"
+                    if resolved.build_plate is not None
+                    else "profile content could not be parsed as JSON"
+                ),
             )
 
         compatible = _str_list(data.get("compatible_printers"))
@@ -420,18 +447,6 @@ class FilamentMatrixBuilder:
                 )
 
         candidate = _to_candidate(name, data, own_data)
-
-        if plate_field is not None and getattr(candidate, plate_field) is None:
-            return None, RejectedFilamentCandidate(
-                profile_name=name,
-                vendor=candidate.vendor,
-                material_type=candidate.material_type,
-                reason_code="incompatible_build_plate",
-                reason=(
-                    f"no {resolved.build_plate} temperature defined for this filament "
-                    f"({plate_field} is unset)"
-                ),
-            )
 
         if vendor is not None:
             if not candidate.vendor or vendor.lower() not in candidate.vendor.lower():
@@ -451,6 +466,21 @@ class FilamentMatrixBuilder:
                     material_type=candidate.material_type,
                     reason_code="material_filter",
                     reason=f"material type does not match filter {material!r}",
+                )
+
+        if resolved.build_plate is not None:
+            compatibility_error: str | None
+            if plate_field is None:
+                compatibility_error = "selected plate key is not approved"
+            else:
+                compatibility_error = _plate_support_error(data, plate_field)
+            if compatibility_error is not None:
+                return None, RejectedFilamentCandidate(
+                    profile_name=name,
+                    vendor=candidate.vendor,
+                    material_type=candidate.material_type,
+                    reason_code="incompatible_build_plate",
+                    reason=compatibility_error,
                 )
 
         return candidate, None

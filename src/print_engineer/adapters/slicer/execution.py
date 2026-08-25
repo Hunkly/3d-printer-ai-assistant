@@ -356,7 +356,10 @@ class SliceExecutor:
                     "config_materialization_failed",
                     "Increment 2 realization was not successful",
                 )
-            source = model_identity.path
+            try:
+                source = model_identity.path.resolve(strict=True)
+            except (FileNotFoundError, OSError, RuntimeError) as exc:
+                return _failure(run_id, "invalid_source_model", str(exc))
             if not source.is_file() or source.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
                 return _failure(
                     run_id, "invalid_source_model", "authoritative source model is missing"

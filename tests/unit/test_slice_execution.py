@@ -238,9 +238,11 @@ class _FakeSlicer:
         self.return_code = return_code
         self.write_output = write_output
         self.calls = 0
+        self.jobs: list[object] = []
 
     def slice(self, job: object) -> object:
         self.calls += 1
+        self.jobs.append(job)
         output_dir = cast(Any, job).output_dir
         assert output_dir is not None
         if self.write_output:
@@ -363,6 +365,143 @@ def test_realized_execution_success_and_source_preservation(
     assert result.observed_facts == ObservedSliceFacts(1, 2, 2.0, 0.4, 12.5, 0.1, 1.24)
     assert model.path.read_bytes() == source_before
     assert result.workspace_path.is_dir()
+
+
+def test_relative_source_resolves_once_and_hands_off_absolute_verified_path(
+    tmp_path: Path,
+    realization_fixture: tuple[RealizationResult, ModelIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    realization, model = realization_fixture
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    source = caller / "model.stl"
+    source.write_bytes(b"caller source")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    original = Path.resolve
+    resolve_calls = 0
+
+    def resolve_once(path: Path, *, strict: bool = False) -> Path:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_once)
+    monkeypatch.chdir(caller)
+    original_model = ModelIdentity(Path("model.stl"), digest)
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
+        realization, original_model
+    )
+    assert isinstance(result, SliceExecutionSuccess)
+    assert resolve_calls == 1
+    assert original_model.path == Path("model.stl")
+    assert result.model_identity is original_model
+    assert len(slicer.jobs) == 1
+    job = cast(Any, slicer.jobs[0])
+    assert job.model_path.is_absolute()
+    assert job.model_path == source.resolve(strict=True)
+    assert job.model_path.read_bytes() == source.read_bytes()
+    assert job.model_path == source
+    assert model.path != original_model.path
+
+
+def test_absolute_source_remains_absolute_and_successful(
+    tmp_path: Path, realization_fixture: tuple[RealizationResult, ModelIdentity]
+) -> None:
+    realization, model = realization_fixture
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization, model)
+    assert isinstance(result, SliceExecutionSuccess)
+    job = cast(Any, slicer.jobs[0])
+    assert job.model_path.is_absolute()
+    assert job.model_path == model.path.resolve(strict=True)
+
+
+def test_missing_relative_source_does_not_search_or_invoke_slicer(
+    tmp_path: Path,
+    realization_fixture: tuple[RealizationResult, ModelIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    realization, model = realization_fixture
+    monkeypatch.chdir(tmp_path)
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
+        realization, ModelIdentity(Path("missing.stl"), model.sha256)
+    )
+    assert isinstance(result, SliceExecutionFailure)
+    assert result.stage == "invalid_source_model"
+    assert slicer.calls == 0
+
+
+@pytest.mark.parametrize(
+    "error", [FileNotFoundError("missing"), OSError("unreadable"), RuntimeError("loop")]
+)
+def test_source_resolution_exceptions_are_invalid_source(
+    tmp_path: Path,
+    realization_fixture: tuple[RealizationResult, ModelIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    realization, model = realization_fixture
+    original_resolve = Path.resolve
+
+    def fail_resolve(path: Path, *, strict: bool = False) -> Path:
+        if path == model.path:
+            raise error
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(realization, model)
+    assert isinstance(result, SliceExecutionFailure)
+    assert result.stage == "invalid_source_model"
+    assert slicer.calls == 0
+
+
+def test_relative_sha_mismatch_blocks_slicer(
+    tmp_path: Path,
+    realization_fixture: tuple[RealizationResult, ModelIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    realization, model = realization_fixture
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    source = caller / "model.stl"
+    source.write_bytes(b"verified source")
+    monkeypatch.chdir(caller)
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
+        realization, ModelIdentity(Path("model.stl"), "0" * 64)
+    )
+    assert isinstance(result, SliceExecutionFailure)
+    assert result.stage == "source_model_identity_mismatch"
+    assert slicer.calls == 0
+
+
+def test_relative_basename_collision_never_substitutes_workspace_file(
+    tmp_path: Path,
+    realization_fixture: tuple[RealizationResult, ModelIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    realization, _ = realization_fixture
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    source = caller / "model.stl"
+    source.write_bytes(b"caller bytes")
+    monkeypatch.chdir(caller)
+    slicer = _FakeSlicer()
+    result = SliceExecutor(tmp_path / "slice", cast(Any, slicer)).execute(
+        realization,
+        ModelIdentity(Path("model.stl"), hashlib.sha256(source.read_bytes()).hexdigest()),
+    )
+    assert isinstance(result, SliceExecutionSuccess)
+    job = cast(Any, slicer.jobs[0])
+    collision = job.output_dir / "model.stl"
+    collision.write_bytes(b"workspace bytes")
+    assert job.model_path == source.resolve(strict=True)
+    assert job.model_path.read_bytes() == b"caller bytes"
+    assert collision.read_bytes() != job.model_path.read_bytes()
 
 
 @pytest.mark.parametrize("missing_kind", ["missing", "digest"])

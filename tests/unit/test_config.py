@@ -106,3 +106,18 @@ def test_issue_metadata_yaml_relative_path_uses_explicit_root(tmp_path: Path) ->
     root = tmp_path / "project-root"
     settings = Settings.load(config_path=config, root=root)
     assert settings.printer.issue_metadata_paths == (root / "metadata.json",)
+def test_orca_appdata_path_rebase_and_legacy_default(tmp_path: Path) -> None:
+    assert Settings(root=tmp_path).slicer.orca_appdata_path is None
+    relative = Settings.model_validate(
+        {"root": tmp_path, "slicer": {"orca_appdata_path": "profiles"}}
+    )
+    assert relative.slicer.orca_appdata_path == tmp_path / "profiles"
+    absolute_path = tmp_path / "absolute-profiles"
+    absolute = Settings.model_validate(
+        {"root": tmp_path, "slicer": {"orca_appdata_path": absolute_path}}
+    )
+    assert absolute.slicer.orca_appdata_path == absolute_path
+    legacy = Settings.model_validate(
+        {"root": tmp_path, "slicer": {"orca_install_path": "orca.exe"}}
+    )
+    assert legacy.slicer.orca_install_path == "orca.exe"

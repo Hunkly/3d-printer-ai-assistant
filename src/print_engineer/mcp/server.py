@@ -25,7 +25,7 @@ def create_server(settings: Settings) -> FastMCP:
 
     mcp = FastMCP(settings.mcp.server_name, version=__version__)
 
-    from print_engineer.mcp.tools import model, printer, recommend, slicer, system
+    from print_engineer.mcp.tools import model, prepare, printer, recommend, slicer, system
 
     mcp.tool(name="system.info", description="Project metadata (name, version, runtime).")(
         system.system_info
@@ -39,6 +39,8 @@ def create_server(settings: Settings) -> FastMCP:
         mcp.tool(name=name, description=_model_tool_description(name))(tool)
     for name, tool in recommend.build_tools(settings).items():
         mcp.tool(name=name, description=_recommend_tool_description(name))(tool)
+    for name, tool in prepare.build_tools(settings).items():
+        mcp.tool(name=name, description=_prepare_tool_description(name))(tool)
     for name, tool in printer.build_tools(settings).items():
         mcp.tool(name=name, description=_printer_tool_description(name))(tool)
     return mcp
@@ -81,6 +83,15 @@ def _printer_tool_description(name: str) -> str:
         ),
     }
     return descriptions.get(name, "Printer tool.")
+
+
+def _prepare_tool_description(name: str) -> str:
+    return (
+        "Locally prepares and slices a model with the supported Orca pipeline and returns a "
+        "verified preparation result. Does not upload, start printing, or modify printer "
+        "state. Explicit material is a hard constraint; omitted material permits deterministic "
+        "compatible selection."
+    )
 
 
 def _model_tool_description(name: str) -> str:

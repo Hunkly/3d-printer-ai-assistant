@@ -10,7 +10,7 @@ from fastmcp import Client
 from fastmcp.server.server import FastMCP
 
 from print_engineer.config import Settings
-from print_engineer.mcp.server import create_server
+from print_engineer.mcp.server import _prepare_tool_description, create_server
 
 
 @pytest.fixture
@@ -26,7 +26,8 @@ def test_server_registers_system_tools(server: FastMCP) -> None:
         return {tool.name for tool in tools}
 
     names = asyncio.run(run())
-    assert {"system.info", "system.health"} <= names
+    assert {"system.info", "system.health", "print.prepare"} <= names
+    assert len(names) == len(set(names))
 
 
 def test_call_system_health(server: FastMCP) -> None:
@@ -49,3 +50,8 @@ def test_call_system_info(server: FastMCP) -> None:
     text = asyncio.run(run())
     assert "print-engineer" in text
     assert "python" in text
+def test_public_prepare_description_is_preparation_only() -> None:
+    description = _prepare_tool_description("print.prepare")
+    assert "Does not upload" in description
+    assert "start printing" in description
+    assert "explicit material" in description.lower()

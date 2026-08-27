@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 import pytest
@@ -201,3 +202,26 @@ class TestResolveProfiles:
         )
         assert resolved.filament is not None
         assert resolved.filament.material_type == "PLA"
+
+    def test_authoritative_same_name_process_sources_fail_closed(self) -> None:
+        adapter = _adapter()
+        process = adapter.profiles[ProfileKind.PROCESS][0]
+        duplicate = make_profile(
+            ProfileKind.PROCESS,
+            process.name,
+            _PROCESS,
+            setting_id="OTHER",
+        )
+        adapter.profiles[ProfileKind.PROCESS].append(duplicate)
+        adapter.materialized[f"process:{process.name}"] = process
+        with pytest.raises(AmbiguousPrintContext):
+            _resolver(adapter).resolve_with_authority(
+                PrintContextIntent(printer="Bambu Lab A1 0.4 nozzle")
+            )
+def test_authority_api_is_additive() -> None:
+    from print_engineer.recommendation.context import ResolvedContextAuthority
+
+    assert is_dataclass(ResolvedContextAuthority)
+    assert {field.name for field in fields(ResolvedContextAuthority)} == {
+        "context", "printer_profiles", "process_profile"
+    }

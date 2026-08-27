@@ -14,6 +14,7 @@ a printer.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
@@ -37,7 +38,7 @@ from print_engineer.errors import (
     LLMUnavailable,
     UnresolvedPrintContext,
 )
-from print_engineer.recommendation.context import PrintContextResolver
+from print_engineer.recommendation.context import PrintContextResolver, ResolvedContextAuthority
 from print_engineer.recommendation.filament import FilamentMatrixBuilder
 from print_engineer.recommendation.prompt import (
     build_setup_prompt,
@@ -58,9 +59,7 @@ _GOAL_HINTS: dict[RecommendationGoal, str] = {
     RecommendationGoal.BALANCED: "keep the printer's default process as a starting point",
 }
 
-_EXTERNAL_GOALS = frozenset(
-    {RecommendationGoal.STRENGTH, RecommendationGoal.SURFACE_QUALITY}
-)
+_EXTERNAL_GOALS = frozenset({RecommendationGoal.STRENGTH, RecommendationGoal.SURFACE_QUALITY})
 
 
 def _normalize(text: str) -> str:
@@ -93,6 +92,11 @@ class SetupEngine:
 
     def recommend(self, request: SetupRequest) -> SetupRecommendation:
         resolved = self._resolver.resolve(request)
+        return self._recommend_resolved(request, resolved)
+
+    def _recommend_resolved(
+        self, request: SetupRequest, resolved: ResolvedPrintContext
+    ) -> SetupRecommendation:
         if resolved.printer is None:
             raise UnresolvedPrintContext(
                 "a printer is required for a setup recommendation; no default was requested",
@@ -140,6 +144,15 @@ class SetupEngine:
             summary=summary,
             warnings=warnings,
         )
+
+    def recommend_authoritative(self, request: SetupRequest) -> AuthoritativeSetupSelection:
+        """Return the deterministic recommendation with its exact source profiles."""
+        authority = self._resolver.resolve_with_authority(request)
+        recommendation = self._recommend_resolved(request, authority.context)
+        candidate = (
+            recommendation.matrix.candidates[0] if recommendation.matrix.candidates else None
+        )
+        return AuthoritativeSetupSelection(recommendation, authority, candidate)
 
     def _llm_narrative(
         self,
@@ -221,16 +234,11 @@ class SetupEngine:
             alternatives=alternatives,
         )
 
-    def _filament_layer(
-        self, candidates: list[FilamentCandidate]
-    ) -> FilamentRecommendation | None:
+    def _filament_layer(self, candidates: list[FilamentCandidate]) -> FilamentRecommendation | None:
         if not candidates:
             return None
         top = candidates[0]
-        evidence = ", ".join(
-            f"{field}={value}"
-            for field, value in top.goal_scores.items()
-        )
+        evidence = ", ".join(f"{field}={value}" for field, value in top.goal_scores.items())
         rationale = (
             f"Ranked first for the goal with score {top.score:.1f}"
             + (f" ({evidence})" if evidence else "")
@@ -259,7 +267,7 @@ class SetupEngine:
         if chosen is None:
             if 0.4 in supported:
                 chosen = 0.4
-            elif supported:
+            elif len(supported) == 1:
                 chosen = supported[0]
         if chosen is None:
             return None
@@ -285,9 +293,7 @@ class SetupEngine:
         process = resolved.process
         if process is not None:
             name = process.name
-            source = (
-                "user_selected" if request.process_profile is not None else "printer_default"
-            )
+            source = "user_selected" if request.process_profile is not None else "printer_default"
             key_settings: dict[str, float | str | bool | None] = {
                 key: value
                 for key, value in process.model_dump().items()
@@ -299,13 +305,10 @@ class SetupEngine:
             key_settings = {}
         else:
             return None
-        rationale = (
-            "process profile "
-            + (
-                "selected by the user"
-                if source == "user_selected"
-                else "taken from the printer default"
-            )
+        rationale = "process profile " + (
+            "selected by the user"
+            if source == "user_selected"
+            else "taken from the printer default"
         )
         return ProcessRecommendation(
             process_profile=name,
@@ -314,3 +317,10 @@ class SetupEngine:
             key_settings=key_settings,
             goal_hint=_GOAL_HINTS.get(request.goal),
         )
+
+
+@dataclass(frozen=True)
+class AuthoritativeSetupSelection:
+    recommendation: SetupRecommendation
+    context_authority: ResolvedContextAuthority
+    filament_candidate: FilamentCandidate | None

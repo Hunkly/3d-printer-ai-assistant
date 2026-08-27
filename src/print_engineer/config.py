@@ -43,6 +43,7 @@ class SlicerConfig(BaseModel):
     kind: str | None = None
     timeout_seconds: float = 600.0
     orca_install_path: str | None = None
+    orca_appdata_path: Path | None = None
     bambu_install_path: str | None = None
 
 
@@ -136,6 +137,8 @@ class Settings(BaseModel):
         self.storage.workspace_dir = resolve(self.root, self.storage.workspace_dir)
         self.logging.log_dir = resolve(self.root, self.logging.log_dir)
         self.logging.json_log_path = resolve(self.root, self.logging.json_log_path)
+        if self.slicer.orca_appdata_path is not None:
+            self.slicer.orca_appdata_path = resolve(self.root, self.slicer.orca_appdata_path)
         self.printer.issue_metadata_paths = tuple(
             resolve(self.root, path) for path in self.printer.issue_metadata_paths
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from tests.slicer_helpers import FakeProfileAdapter, make_profile
@@ -626,6 +627,23 @@ def _engine(
 
 
 class TestSetupEngine:
+    def test_authoritative_recommendation_resolves_once(self) -> None:
+        adapter = _adapter()
+        engine = _engine(adapter)
+        resolver = engine._resolver
+        calls = 0
+        original = resolver.resolve_with_authority
+
+        def counted(request: SetupRequest) -> Any:
+            nonlocal calls
+            calls += 1
+            return original(request)
+
+        cast(Any, resolver).resolve_with_authority = counted
+        selected = engine.recommend_authoritative(SetupRequest(printer="Bambu Lab A1 0.4 nozzle"))
+        assert calls == 1
+        assert selected.recommendation.context is selected.context_authority.context
+
     def test_full_four_layer_setup(self) -> None:
         engine = _engine(_adapter())
         result = engine.recommend(SetupRequest(printer="Bambu Lab A1"))
@@ -728,3 +746,9 @@ class TestLLMNarrative:
         )
         with pytest.raises(LLMUnavailable):
             engine.recommend(SetupRequest(printer="Bambu Lab A1"))
+def test_authoritative_selection_type_is_internal() -> None:
+    from dataclasses import is_dataclass
+
+    from print_engineer.recommendation.setup import AuthoritativeSetupSelection
+
+    assert is_dataclass(AuthoritativeSetupSelection)
